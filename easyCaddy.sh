@@ -2,7 +2,7 @@
 # caddy_proxy_tool.sh
 # 功能：
 #   1) 自动安装/卸载 Caddy
-#   2) 配置反向代理
+#   2) 配置反向代理（本地端口 / 远程网址）
 #   3) 查看 Caddy 服务状态（在菜单界面显示）
 #   4) 查看当前反向代理配置，并显示上游服务是否在运行
 #   5) 删除指定的反向代理配置
@@ -71,24 +71,205 @@ function check_port_running() {
 }
 
 #--------------------------------------------
-# 配置反向代理（输入域名及上游服务端口，自动构造上游地址）
+# 判断 upstream 是否指向本机回环地址
+# 匹配 http(s)://127.0.0.1、http(s)://localhost、http(s)://[::1]，可带或不带端口
 #--------------------------------------------
-function setup_reverse_proxy() {
-    echo "请输入域名（例如 example.com）："
-    read domain
-    if [ -z "$domain" ]; then
-        echo "域名输入不能为空。"
+function upstream_is_loopback() {
+    local upstream=$1
+    case "$upstream" in
+        http://127.0.0.1|http://127.0.0.1:*|\
+        https://127.0.0.1|https://127.0.0.1:*|\
+        http://localhost|http://localhost:*|\
+        https://localhost|https://localhost:*|\
+        http://\[::1\]|http://\[::1\]:*|\
+        https://\[::1\]|https://\[::1\]:*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+#--------------------------------------------
+# 从回环 upstream 中取端口号
+# 未写明端口且主机名干净时，按协议给默认端口（http=80 / https=443）；
+# 端口段非法或主机名解析不出来时返回空串，由调用方如实显示「端口未知」，
+# 不再静默回落成 80，避免把「解析失败」显示成「127.0.0.1:80 的状态」。
+#--------------------------------------------
+function loopback_port() {
+    local upstream=$1
+    local hostport host
+    hostport=${upstream#*://}
+
+    # 明确带端口：IPv6 字面量 [addr]:8080 与普通 host:8080
+    if [[ "$hostport" =~ ^\[[^]]*\]:([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return
+    fi
+    if [[ "$hostport" =~ ^([^:]+):([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[2]}"
         return
     fi
 
-    echo "请输入上游服务端口（例如 8080）："
-    read port
-    if [ -z "$port" ]; then
-        echo "端口输入不能为空。"
+    # 未写明端口：主机名必须是干净的（非空、无空白、无游离冒号；IPv6 需写成 [addr]）
+    host="$hostport"
+    if [ -z "$host" ] || [[ "$host" == *[[:space:]]* ]]; then
+        return
+    fi
+    if [[ "$host" != \[*\] ]] && [[ "$host" == *:* ]]; then
         return
     fi
 
-    upstream="http://127.0.0.1:${port}"
+    case "$upstream" in
+        https://*) echo 443 ;;
+        *)         echo 80 ;;
+    esac
+}
+
+#--------------------------------------------
+# 检查远程 upstream 是否可达（带超时，探测失败不影响菜单继续使用）
+# 语义说明：这里用 curl -k 探测的是「目标主机是否在线」，不校验证书有效性 ——
+#           自签名证书的内网上游也能被如实报告为可达；
+#           因此「可达」只代表主机与 HTTP(S) 端口能连上，不代表 Caddy 反代一定成功
+#           （Caddy 对 HTTPS 上游默认严格校验证书，证书不被信任时反代仍会失败）。
+#--------------------------------------------
+function check_remote_upstream() {
+    local upstream=$1
+
+    # 优先用 curl：连接超时 2 秒、总超时 4 秒
+    if command -v curl >/dev/null 2>&1; then
+        if curl -k -s -I -o /dev/null --connect-timeout 2 --max-time 4 "$upstream" 2>/dev/null; then
+            echo "可达"
+        else
+            echo "不可达"
+        fi
+        return
+    fi
+
+    # 没有 curl 时退化为 /dev/tcp 探测主机端口
+    local hostport host port
+    hostport=${upstream#*://}
+    hostport=${hostport%%/*}
+    if [[ "$hostport" =~ ^\[[^]]*\]:([0-9]+)$ ]]; then
+        host=${hostport%:*}
+        port="${BASH_REMATCH[1]}"
+    elif [[ "$hostport" =~ ^(.+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        host="$hostport"
+        case "$upstream" in
+            https://*) port=443 ;;
+            *)         port=80 ;;
+        esac
+    fi
+    if timeout 2 bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null; then
+        echo "可达"
+    else
+        echo "不可达"
+    fi
+}
+
+#--------------------------------------------
+# 生成单个反向代理的 Caddyfile 块（本地端口与远程网址共用）
+# 注意：{upstream_hostport} 是 Caddy 占位符，printf 的格式串用单引号包裹，
+#       不会被 shell 展开或吞掉，必须原样写进 Caddyfile。
+#       反代 HTTPS 上游时，Caddy v2.11.0 起会自动把 Host 设为 {upstream_hostport}，
+#       而更早的版本不会，因此这里默认就写入 header_up，跨版本都正确（新版只是冗余）。
+#--------------------------------------------
+function build_proxy_block() {
+    local domain=$1
+    local upstream=$2
+    if upstream_is_loopback "$upstream"; then
+        printf '%s {\n    reverse_proxy %s\n}\n' "$domain" "$upstream"
+    else
+        printf '%s {\n    reverse_proxy %s {\n        header_up Host {upstream_hostport}\n    }\n}\n' "$domain" "$upstream"
+    fi
+}
+
+#--------------------------------------------
+# 校验远程网址输入（不通过时输出错误提示，通过时不输出）
+# 要求：必须显式带 http:// 或 https://，且不含 path / query / fragment
+#--------------------------------------------
+function validate_remote_upstream() {
+    local url=$1
+
+    case "$url" in
+        http://*|https://*) ;;
+        *)
+            echo "错误：远程网址必须以 http:// 或 https:// 开头（不接受裸域名），请重新输入。"
+            return
+            ;;
+    esac
+
+    local rest hostonly portpart
+    rest=${url#*://}
+
+    # 含空白字符（如 "https://a.com b.com"）会让生成的 Caddyfile 语法错误，
+    # caddy 校验失败后 systemctl restart 也会失败，可能连带停掉原有站点，必须拒掉
+    case "$rest" in
+        *[[:space:]]*)
+            echo "错误：远程网址不能包含空格等空白字符，请重新输入。"
+            return
+            ;;
+    esac
+
+    # 含 userinfo（"https://user:pass@host"）不是 Caddy upstream 支持的写法
+    case "$rest" in
+        *@*)
+            echo "错误：远程网址不能包含用户名/密码（@），请只输入 协议 + 主机名（可带端口）。"
+            return
+            ;;
+    esac
+
+    hostonly=${rest%%[/?#]*}
+
+    if [ -z "$hostonly" ]; then
+        echo "错误：远程网址缺少主机名（示例：https://target.example.com），请重新输入。"
+        return
+    fi
+
+    if [ "$hostonly" != "$rest" ]; then
+        echo "错误：远程网址不能包含路径、查询串或锚点（Caddy 的 upstream 地址不支持），请只输入 协议 + 主机名（可带端口）。"
+        return
+    fi
+
+    # 端口段校验：主机段里出现冒号时，最后一段必须是 1-65535 的数字；
+    # 多冒号形式（未加方括号的 IPv6）一律拒绝；
+    # [ ] 包裹的 IPv6 字面量（Caddy 支持）单独放行：端口取 ] 之后的部分，
+    # 否则 ${hostonly##*:} 会把 IPv6 地址里的冒号误当成端口分隔符而误杀合法上游
+    portpart=${hostonly##*:}
+    if [[ "$hostonly" == \[* ]]; then
+        portpart=""
+        if [[ "$hostonly" =~ ^\[[^]]*\]:([0-9]{1,5})$ ]]; then
+            portpart="${BASH_REMATCH[1]}"
+        elif [[ ! "$hostonly" =~ ^\[[^]]*\]$ ]]; then
+            echo "错误：远程网址的主机名格式不正确（IPv6 字面量应写成 [地址] 或 [地址]:端口），请重新输入。"
+            return
+        fi
+    elif [ "$portpart" == "$hostonly" ]; then
+        # 主机段里没有端口（不含冒号），无需端口校验
+        portpart=""
+    else
+        if [[ "$hostonly" == *:*:* ]]; then
+            echo "错误：远程网址的主机名格式不正确（IPv6 请勿直接写在主机位置），请重新输入。"
+            return
+        fi
+    fi
+    if [ -n "$portpart" ] && { ! [[ "$portpart" =~ ^[0-9]{1,5}$ ]] || [ "$portpart" -lt 1 ] || [ "$portpart" -gt 65535 ]; }; then
+        echo "错误：远程网址的端口必须是 1-65535 之间的数字，请重新输入。"
+        return
+    fi
+}
+
+#--------------------------------------------
+# 写入配置并生效（本地端口与远程网址共用）
+#--------------------------------------------
+function apply_reverse_proxy() {
+    local domain=$1
+    local upstream=$2
+    local port
 
     # 检查 Caddyfile 是否备份过，没有则备份一下
     if [ ! -f "$BACKUP_CADDYFILE" ]; then
@@ -97,9 +278,7 @@ function setup_reverse_proxy() {
 
     # 添加新的反向代理配置到 Caddyfile
     echo "配置反向代理：${domain} -> ${upstream}"
-    echo "${domain} {
-    reverse_proxy ${upstream}
-}" | sudo tee -a "$CADDYFILE" >/dev/null
+    build_proxy_block "$domain" "$upstream" | sudo tee -a "$CADDYFILE" >/dev/null
 
     # 将配置信息保存到代理配置列表文件
     echo "${domain} -> ${upstream}" >> "$PROXY_CONFIG_FILE"
@@ -109,10 +288,105 @@ function setup_reverse_proxy() {
     sudo systemctl restart caddy
 
     # 检查上游服务状态
-    status=$(check_port_running "$port")
-    echo "上游服务（127.0.0.1:${port}）状态：$status"
+    if upstream_is_loopback "$upstream"; then
+        port=$(loopback_port "$upstream")
+        echo "上游服务（127.0.0.1:${port}）状态：$(check_port_running "$port")"
+    else
+        echo "上游网址（${upstream}）状态：$(check_remote_upstream "$upstream")"
+    fi
     echo "Caddy 服务状态："
     sudo systemctl status caddy --no-pager
+}
+
+#--------------------------------------------
+# 配置反向代理：反代本地端口（输入域名及上游服务端口）
+#--------------------------------------------
+function setup_reverse_proxy() {
+    echo "请输入域名（例如 example.com）："
+    read domain
+    if [ -z "$domain" ]; then
+        echo "域名输入不能为空。"
+        return
+    fi
+
+    while true; do
+        echo "请输入上游服务端口（例如 8080）："
+        read port
+        if [ -z "$port" ]; then
+            echo "端口输入不能为空。"
+            return
+        fi
+        if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "错误：端口必须是 1-65535 之间的数字（例如 8080），请重新输入。"
+            continue
+        fi
+        break
+    done
+
+    apply_reverse_proxy "$domain" "http://127.0.0.1:${port}"
+}
+
+#--------------------------------------------
+# 配置反向代理：反代远程网址（输入域名及远程网址）
+#--------------------------------------------
+function setup_reverse_proxy_remote() {
+    local upstream=""
+    local err=""
+
+    echo "请输入域名（例如 example.com）："
+    read domain
+    if [ -z "$domain" ]; then
+        echo "域名输入不能为空。"
+        return
+    fi
+
+    while true; do
+        echo "请输入远程网址（必须带 http:// 或 https:// 前缀，例如 https://target.example.com）："
+        read upstream || { echo "输入结束，已取消。"; return; }
+        if [ -z "$upstream" ]; then
+            echo "远程网址输入不能为空。"
+            continue
+        fi
+        err=$(validate_remote_upstream "$upstream")
+        if [ -n "$err" ]; then
+            echo "$err"
+            continue
+        fi
+        break
+    done
+
+    apply_reverse_proxy "$domain" "$upstream"
+}
+
+#--------------------------------------------
+# 反向代理二级菜单
+#--------------------------------------------
+function reverse_proxy_menu() {
+    while true; do
+        echo "============================================="
+        echo "           配置 & 启用反向代理                "
+        echo "============================================="
+        echo " 1) 反代本地端口（域名 -> http://127.0.0.1:端口）"
+        echo " 2) 反代远程网址（域名 -> https://目标网址）"
+        echo " 0) 返回"
+        echo "============================================="
+        read -p "请输入选项: " proxy_opt || return
+        case "$proxy_opt" in
+            1)
+                setup_reverse_proxy
+                ;;
+            2)
+                setup_reverse_proxy_remote
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo "无效选项，请重新输入。"
+                ;;
+        esac
+        echo
+    done
 }
 
 #--------------------------------------------
@@ -135,11 +409,30 @@ function show_reverse_proxies() {
         echo "当前反向代理配置："
         lineno=0
         while IFS= read -r line; do
+            # 行号与配置文件物理行号严格一致（删除功能按物理行号定位，不能跳号）
             lineno=$((lineno+1))
-            # 从配置行中提取端口（假定格式为 "域名 -> http://127.0.0.1:端口"）
-            port=$(echo "$line" | grep -oE '[0-9]{2,5}$')
-            status=$(check_port_running "$port")
-            echo "${lineno}) ${line} [上游服务状态：$status]"
+            # 空行直接跳过：既不必显示，也不能拿空串去探测
+            if [ -z "$line" ]; then
+                continue
+            fi
+            # 解析格式 "域名 -> upstream"，upstream 可能是本地回环地址，也可能是远程网址
+            upstream=$(echo "$line" | awk -F' -> ' '{print $2}')
+            if [ -z "$upstream" ]; then
+                echo "${lineno}) ${line} [配置行格式不正确]"
+                continue
+            fi
+            if upstream_is_loopback "$upstream"; then
+                port=$(loopback_port "$upstream")
+                if [ -z "$port" ]; then
+                    echo "${lineno}) ${line} [本地端口未知（上游地址解析不出端口），未探测]"
+                else
+                    status=$(check_port_running "$port")
+                    echo "${lineno}) ${line} [本地端口 ${port}，上游服务状态：$status]"
+                fi
+            else
+                status=$(check_remote_upstream "$upstream")
+                echo "${lineno}) ${line} [远程网址，可达性：$status]"
+            fi
         done < "$PROXY_CONFIG_FILE"
     else
         echo "没有配置任何反向代理。"
@@ -165,15 +458,22 @@ function delete_reverse_proxy() {
     echo "重新生成 Caddyfile 配置..."
     sudo cp "$BACKUP_CADDYFILE" "$CADDYFILE"
 
-    # 根据代理配置列表重新添加剩余配置
+    # 根据代理配置列表重新添加剩余配置（本地端口与远程网址共用同一个块生成函数）
     if [ -f "$PROXY_CONFIG_FILE" ]; then
         while IFS= read -r line; do
-            # 解析格式 "域名 -> http://127.0.0.1:端口"
+            # 跳过空行与不含 " -> " 分隔符的脏行：否则会写出空主机名或畸形主机名的非法块
+            # （重建是遍历全文重写、不依赖行号，因此这里跳过不影响任何行号语义）
+            if [ -z "$line" ] || [[ "$line" != *" -> "* ]]; then
+                continue
+            fi
+            # 解析格式 "域名 -> upstream"
             domain=$(echo "$line" | awk -F' -> ' '{print $1}')
             upstream=$(echo "$line" | awk -F' -> ' '{print $2}')
-            echo "${domain} {
-    reverse_proxy ${upstream}
-}" | sudo tee -a "$CADDYFILE" >/dev/null
+            # 解析结果任一为空同样跳过，保证只写出合法块
+            if [ -z "$domain" ] || [ -z "$upstream" ]; then
+                continue
+            fi
+            build_proxy_block "$domain" "$upstream" | sudo tee -a "$CADDYFILE" >/dev/null
         done < "$PROXY_CONFIG_FILE"
     fi
 
@@ -241,7 +541,7 @@ function show_menu() {
     echo "           Caddy 一键部署 & 管理脚本          "
     echo "============================================="
     echo " 1) 安装 Caddy（如已安装则跳过）"
-    echo " 2) 配置 & 启用反向代理（输入域名及上游端口）"
+    echo " 2) 配置 & 启用反向代理（反代本地端口 / 远程网址）"
     echo " 3) 查看 Caddy 服务状态"
     echo " 4) 查看当前反向代理配置（显示上游服务状态）"
     echo " 5) 删除指定的反向代理"
@@ -256,7 +556,7 @@ function show_menu() {
 #--------------------------------------------
 while true; do
     show_menu
-    read -p "请输入选项: " opt
+    read -p "请输入选项: " opt || break
     case "$opt" in
         1)
             if check_caddy_installed; then
@@ -270,7 +570,7 @@ while true; do
                 echo "Caddy 未安装，先执行安装步骤。"
                 install_caddy
             fi
-            setup_reverse_proxy
+            reverse_proxy_menu
             ;;
         3)
             show_caddy_status
