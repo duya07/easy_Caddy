@@ -270,6 +270,20 @@ function apply_reverse_proxy() {
     local domain=$1
     local upstream=$2
     local port
+    local cfg_line cfg_domain
+
+    # 同一域名不允许重复配置：否则 Caddyfile 里会出现两个同名 site 块，
+    # Caddy 遇到重复 site 地址的行为不可预期。这里按 " -> " 前的字段做精确比较
+    # （不是子串匹配），避免把 sub.example.com 误判成已配置的 example.com。
+    if [ -f "$PROXY_CONFIG_FILE" ]; then
+        while IFS= read -r cfg_line; do
+            cfg_domain="${cfg_line%% -> *}"
+            if [ "$cfg_domain" = "$domain" ]; then
+                echo "错误：域名 ${domain} 已配置，请先用菜单 5 删除后再添加。"
+                return
+            fi
+        done < "$PROXY_CONFIG_FILE"
+    fi
 
     # 检查 Caddyfile 是否备份过，没有则备份一下
     if [ ! -f "$BACKUP_CADDYFILE" ]; then
@@ -440,9 +454,75 @@ function show_reverse_proxies() {
 }
 
 #--------------------------------------------
+# 从当前 Caddyfile 中按块删除指定域名的 site 块
+# 用法：remove_proxy_block <域名>
+# 说明：域名按字面比较（不用正则，域名里的 . 不会被当成通配），
+#       并按花括号深度找到配对的 }，因此远程块里 reverse_proxy 的嵌套 { } 也能正确处理；
+#       其余内容与顺序保持不变；找不到该块时只给提示、不报错。
+#--------------------------------------------
+function remove_proxy_block() {
+    local domain=$1
+    local srcfile tmpfile line trimmed
+    local in_block=0 depth=0 removed=0 braces_open braces_close
+
+    if [ ! -f "$CADDYFILE" ]; then
+        echo "Caddyfile 不存在（${CADDYFILE}），已跳过。"
+        return
+    fi
+
+    srcfile=$(mktemp) || return 1
+    tmpfile=$(mktemp) || { rm -f "$srcfile"; return 1; }
+
+    # 读取当前 Caddyfile（Caddyfile 属 root 时用 sudo 拷出来读）
+    if ! cp "$CADDYFILE" "$srcfile" 2>/dev/null; then
+        if ! sudo cp "$CADDYFILE" "$srcfile" 2>/dev/null; then
+            echo "无法读取 Caddyfile（${CADDYFILE}），已跳过。"
+            rm -f "$srcfile" "$tmpfile"
+            return
+        fi
+    fi
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$in_block" -eq 0 ]; then
+            # 只认行首（允许前导空白）精确为 "<域名> {" 的那一行
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            if [ "$trimmed" = "${domain} {" ] || [ "$trimmed" = "${domain}{" ]; then
+                in_block=1
+                depth=1
+                removed=1
+                continue
+            fi
+            printf '%s\n' "$line" >> "$tmpfile"
+        else
+            # 块内：按花括号深度找配对的 }（嵌套的 { } 一并计数）。
+            # 这里用 tr 计数而不是参数扩展：参数扩展里用 } 做字符类（${line//[^}]/}）
+            # 时，bash 会把那个 } 当成 ${...} 的结束符导致解析错位，实测结果是往
+            # 替换结果里多塞进一个 "]/}"，于是删除后会残留一个孤立的 }。
+            braces_open=$(printf '%s' "$line" | tr -cd '{' | wc -c)
+            braces_close=$(printf '%s' "$line" | tr -cd '}' | wc -c)
+            depth=$((depth + braces_open - braces_close))
+            if [ "$depth" -le 0 ]; then
+                in_block=0
+            fi
+        fi
+    done < "$srcfile"
+
+    if [ "$removed" -eq 1 ]; then
+        if ! cp "$tmpfile" "$CADDYFILE" 2>/dev/null; then
+            sudo cp "$tmpfile" "$CADDYFILE"
+        fi
+    else
+        echo "Caddyfile 中未找到域名 ${domain} 的配置块，已跳过。"
+    fi
+
+    rm -f "$srcfile" "$tmpfile"
+}
+
+#--------------------------------------------
 # 删除指定的反向代理
 #--------------------------------------------
 function delete_reverse_proxy() {
+    local target_domain
     show_reverse_proxies
     echo "请输入要删除的反向代理配置编号："
     read proxy_number
@@ -451,31 +531,21 @@ function delete_reverse_proxy() {
         return
     fi
 
-    # 删除对应行
+    # 先取出该编号对应的域名，用于稍后从 Caddyfile 里按块删除
+    target_domain=$(sed -n "${proxy_number}p" "$PROXY_CONFIG_FILE" | awk -F' -> ' '{print $1}')
+    if [ -z "$target_domain" ]; then
+        echo "配置文件中没有第 ${proxy_number} 行，已跳过。"
+        return
+    fi
+
+    # 删除配置列表里对应的行
     sed -i "${proxy_number}d" "$PROXY_CONFIG_FILE"
 
-    # 重新生成 Caddyfile 配置（恢复为备份版本）
-    echo "重新生成 Caddyfile 配置..."
-    sudo cp "$BACKUP_CADDYFILE" "$CADDYFILE"
-
-    # 根据代理配置列表重新添加剩余配置（本地端口与远程网址共用同一个块生成函数）
-    if [ -f "$PROXY_CONFIG_FILE" ]; then
-        while IFS= read -r line; do
-            # 跳过空行与不含 " -> " 分隔符的脏行：否则会写出空主机名或畸形主机名的非法块
-            # （重建是遍历全文重写、不依赖行号，因此这里跳过不影响任何行号语义）
-            if [ -z "$line" ] || [[ "$line" != *" -> "* ]]; then
-                continue
-            fi
-            # 解析格式 "域名 -> upstream"
-            domain=$(echo "$line" | awk -F' -> ' '{print $1}')
-            upstream=$(echo "$line" | awk -F' -> ' '{print $2}')
-            # 解析结果任一为空同样跳过，保证只写出合法块
-            if [ -z "$domain" ] || [ -z "$upstream" ]; then
-                continue
-            fi
-            build_proxy_block "$domain" "$upstream" | sudo tee -a "$CADDYFILE" >/dev/null
-        done < "$PROXY_CONFIG_FILE"
-    fi
+    # 只从当前 Caddyfile 里删除这一个域名的 site 块。
+    # 注意：这里不再从 .bak 整体恢复再把剩余块重新追加 —— 那会把用户在脚本外
+    # 对 Caddyfile 做的改动（自己加的站点、注释等）一起回滚掉。
+    echo "正在从 Caddyfile 中删除 ${target_domain} 的配置块..."
+    remove_proxy_block "$target_domain"
 
     # 重启 Caddy 服务
     echo "重启 Caddy 服务..."
