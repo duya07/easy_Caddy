@@ -192,151 +192,349 @@ function build_proxy_block() {
 # 校验远程网址输入（不通过时输出错误提示，通过时不输出）
 # 要求：必须显式带 http:// 或 https://，且不含 path / query / fragment
 #--------------------------------------------
-function validate_remote_upstream() {
-    local url=$1
+#--------------------------------------------
+# 输入仅接受单个 DNS 主机/IP 与 http(s) authority，不让输入成为配置语法。
+#--------------------------------------------
+function valid_proxy_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
 
-    case "$url" in
-        http://*|https://*) ;;
-        *)
-            echo "错误：远程网址必须以 http:// 或 https:// 开头（不接受裸域名），请重新输入。"
-            return
-            ;;
-    esac
+function valid_ipv4_literal() {
+    local address=$1 part
+    local -a parts
+    [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a parts <<< "$address"
+    for part in "${parts[@]}"; do
+        [[ ${#part} -le 3 ]] && (( 10#$part <= 255 )) || return 1
+    done
+}
 
-    local rest hostonly portpart
-    rest=${url#*://}
-
-    # 含空白字符（如 "https://a.com b.com"）会让生成的 Caddyfile 语法错误，
-    # caddy 校验失败后 systemctl restart 也会失败，可能连带停掉原有站点，必须拒掉
-    case "$rest" in
-        *[[:space:]]*)
-            echo "错误：远程网址不能包含空格等空白字符，请重新输入。"
-            return
-            ;;
-    esac
-
-    # 含 userinfo（"https://user:pass@host"）不是 Caddy upstream 支持的写法
-    case "$rest" in
-        *@*)
-            echo "错误：远程网址不能包含用户名/密码（@），请只输入 协议 + 主机名（可带端口）。"
-            return
-            ;;
-    esac
-
-    hostonly=${rest%%[/?#]*}
-
-    if [ -z "$hostonly" ]; then
-        echo "错误：远程网址缺少主机名（示例：https://target.example.com），请重新输入。"
-        return
+function valid_ipv6_literal() {
+    local address=$1 left right group suffix
+    local -a groups
+    if [[ "$address" == *.* ]]; then
+        suffix=${address##*:}
+        valid_ipv4_literal "$suffix" || return 1
+        address="${address%:*}:0:0"
     fi
-
-    if [ "$hostonly" != "$rest" ]; then
-        echo "错误：远程网址不能包含路径、查询串或锚点（Caddy 的 upstream 地址不支持），请只输入 协议 + 主机名（可带端口）。"
-        return
-    fi
-
-    # 端口段校验：主机段里出现冒号时，最后一段必须是 1-65535 的数字；
-    # 多冒号形式（未加方括号的 IPv6）一律拒绝；
-    # [ ] 包裹的 IPv6 字面量（Caddy 支持）单独放行：端口取 ] 之后的部分，
-    # 否则 ${hostonly##*:} 会把 IPv6 地址里的冒号误当成端口分隔符而误杀合法上游
-    portpart=${hostonly##*:}
-    if [[ "$hostonly" == \[* ]]; then
-        portpart=""
-        if [[ "$hostonly" =~ ^\[[^]]*\]:([0-9]{1,5})$ ]]; then
-            portpart="${BASH_REMATCH[1]}"
-        elif [[ ! "$hostonly" =~ ^\[[^]]*\]$ ]]; then
-            echo "错误：远程网址的主机名格式不正确（IPv6 字面量应写成 [地址] 或 [地址]:端口），请重新输入。"
-            return
-        fi
-    elif [ "$portpart" == "$hostonly" ]; then
-        # 主机段里没有端口（不含冒号），无需端口校验
-        portpart=""
+    [[ "$address" =~ ^[[:xdigit:]:]+$ && "$address" == *:* ]] || return 1
+    if [[ "$address" == *::* ]]; then
+        left=${address%%::*}
+        right=${address#*::}
+        [[ "$right" != *::* && "$left" != *: && "$right" != :* ]] || return 1
+        address="${left}${left:+:}${right}"
+        if [ -z "$address" ]; then return 0; fi
+        IFS=: read -r -a groups <<< "$address"
+        [ "${#groups[@]}" -lt 8 ] || return 1
     else
-        if [[ "$hostonly" == *:*:* ]]; then
-            echo "错误：远程网址的主机名格式不正确（IPv6 请勿直接写在主机位置），请重新输入。"
-            return
+        [[ "$address" != :* && "$address" != *: ]] || return 1
+        IFS=: read -r -a groups <<< "$address"
+        [ "${#groups[@]}" -eq 8 ] || return 1
+    fi
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[[:xdigit:]]{1,4}$ ]] || return 1
+    done
+}
+
+function validate_proxy_domain() {
+    local host=$1 label
+    local -a labels
+    if [[ "$host" == \[*\] ]]; then
+        valid_ipv6_literal "${host:1:${#host}-2}" && return 0
+    elif [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        valid_ipv4_literal "$host" && return 0
+    elif [[ ${#host} -le 253 && "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.?$ ]]; then
+        host=${host%.}
+        IFS=. read -r -a labels <<< "$host"
+        for label in "${labels[@]}"; do
+            if [[ ! "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ || ${#label} -gt 63 ]]; then
+                echo "错误：域名的标签格式不正确。"
+                return 1
+            fi
+        done
+        return 0
+    fi
+    echo "错误：请输入单个合法域名或 IP，不能包含路径、端口或配置语法。"
+    return 1
+}
+
+function validate_remote_upstream() {
+    local url=$1 authority host port=""
+    case "$url" in
+        http://*|https://*) authority=${url#*://} ;;
+        *) echo "错误：远程网址必须以 http:// 或 https:// 开头。"; return 1 ;;
+    esac
+    if [[ "$authority" == \[* ]]; then
+        if [[ "$authority" =~ ^\[([^]]+)\](:([0-9]+))?$ ]]; then
+            host=${BASH_REMATCH[1]}
+            port=${BASH_REMATCH[3]}
+            if ! valid_ipv6_literal "$host"; then
+                echo "错误：IPv6 主机地址不正确。"; return 1
+            fi
+        else
+            echo "错误：IPv6 authority 应为 [地址] 或 [地址]:端口。"; return 1
+        fi
+    else
+        if [[ "$authority" =~ ^([^:]+)(:([0-9]+))?$ ]]; then
+            host=${BASH_REMATCH[1]}
+            port=${BASH_REMATCH[3]}
+            validate_proxy_domain "$host" || return 1
+        else
+            echo "错误：网址必须是 协议 + 主机名（可带数字端口），不能含空主机或空端口。"; return 1
         fi
     fi
-    if [ -n "$portpart" ] && { ! [[ "$portpart" =~ ^[0-9]{1,5}$ ]] || [ "$portpart" -lt 1 ] || [ "$portpart" -gt 65535 ]; }; then
-        echo "错误：远程网址的端口必须是 1-65535 之间的数字，请重新输入。"
-        return
+    if [ -n "$port" ] && ! valid_proxy_port "$port"; then
+        echo "错误：端口必须是 1-65535 之间的数字。"; return 1
     fi
+    return 0
+}
+
+#--------------------------------------------
+# awk 只定位词法 token 的字节范围；真正的裁剪由 head/tail 完成，保留 EOF/CRLF。
+# 花括号仅在独立的未引用 token 时计入结构；引号/反引号/占位符不是块边界。
+# 顶层 import、动态地址、共享地址及不完整边界无法安全编辑时失败。
+# mode=check: 无重复返回0，有目标返回10；mode=delete: 输出开始/结束字节。
+#--------------------------------------------
+function caddy_site_span() {
+    local source=$1 domain=$2 mode=$3 size
+    size=$(wc -c < "$source") || return 1
+    LC_ALL=C awk -v wanted="${domain,,}" -v mode="$mode" -v total="$size" '
+    function error(message) { print "错误：" message > "/dev/stderr"; bad=1 }
+    function host(address, position) {
+        address=tolower(address)
+        sub(/^https?:\/\//, "", address)
+        sub(/\/.*/, "", address)
+        if (substr(address,1,1)=="[") {
+            position=index(address,"]")
+            if (!position) return ""
+            return substr(address,1,position)
+        }
+        sub(/:.*/, "", address)
+        sub(/\.$/, "", address)
+        return address
+    }
+    function emit(value, quoted, finish, n, parts, j, target, addresses) {
+        if (!quoted && value ~ /^<</) error("不支持 heredoc 多行内容，拒绝自动编辑。")
+        if (!quoted && value=="{") {
+            if (depth==0) {
+                target=0; addresses=0
+                for (j=1;j<=headers;j++) {
+                    if (header[j]=="import" || header[j] ~ /[{}]/) error("不能安全识别顶层 import 或动态地址。")
+                    n=split(header[j],parts,",")
+                    for (k=1;k<=n;k++) if (parts[k]!="") {
+                        addresses++
+                        if (host(parts[k])==wanted) target=1
+                    }
+                }
+                if (target) {
+                    found++
+                    if (addresses!=1) error("目标在多地址共享站点中，拒绝删除别名。")
+                    if (mode=="delete" && header[1] !~ /^(https?:\/\/)?[^/]+$/) error("不能安全删除带路径的站点。")
+                    begin=header_start
+                }
+                deleting=target
+                headers=0
+            }
+            depth++
+        } else if (!quoted && value=="}") {
+            depth--
+            if (depth<0) error("Caddyfile 块边界不完整。")
+            if (depth==0 && deleting) {
+                if (substr(text,finish+1) !~ /^[ \t\r]*(#.*)?$/) error("目标结束行包含其他内容，拒绝编辑。")
+                end=line_end
+                deleting=0
+            }
+        } else if (depth==0) {
+            if (headers==0) {
+                if (substr(text,1,token_start-1) !~ /^[ \t\r]*$/) error("站点头与其他内容共用一行，拒绝编辑。")
+                header_start=offset
+            }
+            header[++headers]=value
+            if (value=="import") error("顶层 import 可能包含站点，拒绝自动编辑。")
+        }
+    }
+    BEGIN { sub(/\.$/, "", wanted); depth=0; quote=""; token=""; offset=0 }
+    {
+        text=$0; line_end=offset+length(text)
+        if (line_end<total) line_end++
+        for (i=1;i<=length(text);i++) {
+            c=substr(text,i,1)
+            if (quote!="") {
+                if (quote=="\"" && c=="\\") {
+                    i++; if (i>length(text)) error("不支持跨行转义的引号内容。")
+                    else token=token substr(text,i,1)
+                } else if (c==quote) {
+                    quote=""; in_quote=1
+                } else token=token c
+                continue
+            }
+            if (c ~ /[ \t\r]/) {
+                if (started) { emit(token,in_quote,i-1); token=""; started=0; in_quote=0 }
+            } else if (c=="#" && !started) {
+                break
+            } else if (c=="\"" || c=="`") {
+                if (started) error("不能安全识别混合引用 token。")
+                if (!started) token_start=i
+                quote=c; started=1; in_quote=1
+            } else {
+                if (in_quote) error("引用 token 后缺少分隔符。")
+                if (!started) token_start=i
+                started=1; token=token c
+            }
+        }
+        if (quote=="") {
+            if (started) emit(token,in_quote,length(text))
+            token=""; started=0; in_quote=0
+        } else token=token "\n"
+        offset=line_end
+    }
+    END {
+        if (quote!="" || depth!=0 || headers!=0) error("Caddyfile 词法/块边界不完整，未编辑。")
+        if (bad) exit 2
+        if (mode=="check") { if (found) exit 10; exit 0 }
+        if (found!=1) { error("未找到唯一目标站点，未编辑。"); exit 2 }
+        print begin, end
+    }' "$source"
+}
+
+function caddy_prepare_transaction() {
+    local work=$1
+    if [ ! -f "$CADDYFILE" ] || ! sudo cp -p "$CADDYFILE" "$work/original.caddy"; then
+        echo "错误：无法读取现有 Caddyfile。"; return 1
+    fi
+    if [ -e "$PROXY_CONFIG_FILE" ]; then
+        if [ ! -f "$PROXY_CONFIG_FILE" ] || ! sudo cp -p "$PROXY_CONFIG_FILE" "$work/original.registry"; then
+            echo "错误：无法读取注册表。"; return 1
+        fi
+        : > "$work/had-registry" || return 1
+    else
+        : > "$work/original.registry" || return 1
+    fi
+    cp -p "$work/original.caddy" "$work/candidate.caddy" &&
+        cp -p "$work/original.registry" "$work/candidate.registry"
+}
+
+function caddy_restore_transaction() {
+    local work=$1 reload_attempted=$2 failed=0
+    sudo cp -p "$work/original.caddy" "$CADDYFILE" || failed=1
+    if [ -f "$work/had-registry" ]; then
+        sudo cp -p "$work/original.registry" "$PROXY_CONFIG_FILE" || failed=1
+    else
+        sudo rm -f "$PROXY_CONFIG_FILE" || failed=1
+    fi
+    if [ "$reload_attempted" -eq 1 ] && ! sudo systemctl reload caddy; then
+        echo "错误：原文件已尝试恢复，但重新加载原配置失败，服务状态需确认。"
+        failed=1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        echo "错误：恢复未完整完成，恢复材料保留在：$work"
+    else
+        echo "错误：变更失败，原配置和注册表已恢复。"
+        sudo rm -rf "$work"
+    fi
+    return 1
+}
+
+function caddy_commit_transaction() {
+    local work=$1
+    if ! sudo caddy validate --adapter caddyfile --config "$work/candidate.caddy"; then
+        echo "错误：候选 Caddyfile 校验失败，原文件未改动。"
+        sudo rm -rf "$work"; return 1
+    fi
+    # 拒绝覆盖读取快照后发生的外部变更。
+    if ! sudo cmp -s "$work/original.caddy" "$CADDYFILE" ||
+        { [ -f "$work/had-registry" ] && ! sudo cmp -s "$work/original.registry" "$PROXY_CONFIG_FILE"; } ||
+        { [ ! -f "$work/had-registry" ] && [ -e "$PROXY_CONFIG_FILE" ]; }; then
+        echo "错误：配置或注册表已被其他操作改动，未提交。"
+        sudo rm -rf "$work"; return 1
+    fi
+    if [ ! -e "$BACKUP_CADDYFILE" ] && ! sudo cp -p "$work/original.caddy" "$BACKUP_CADDYFILE"; then
+        echo "错误：无法创建首次备份，原配置未改动；恢复材料：$work"
+        return 1
+    fi
+    if ! sudo cp "$work/candidate.caddy" "$CADDYFILE"; then
+        echo "错误：提交 Caddyfile 失败。"
+        caddy_restore_transaction "$work" 0; return 1
+    fi
+    if ! sudo cp "$work/candidate.registry" "$PROXY_CONFIG_FILE"; then
+        echo "错误：提交注册表失败。"
+        caddy_restore_transaction "$work" 0; return 1
+    fi
+    if ! sudo systemctl reload caddy; then
+        echo "错误：Caddy reload 失败。"
+        caddy_restore_transaction "$work" 1; return 1
+    fi
+    sudo rm -rf "$work"
+    return 0
 }
 
 #--------------------------------------------
 # 写入配置并生效（本地端口与远程网址共用）
 #--------------------------------------------
 function apply_reverse_proxy() {
-    local domain=$1
-    local upstream=$2
-    local port
-    local cfg_line cfg_domain
-
-    # 同一域名不允许重复配置：否则 Caddyfile 里会出现两个同名 site 块，
-    # Caddy 遇到重复 site 地址的行为不可预期。这里按 " -> " 前的字段做精确比较
-    # （不是子串匹配），避免把 sub.example.com 误判成已配置的 example.com。
-    if [ -f "$PROXY_CONFIG_FILE" ]; then
-        while IFS= read -r cfg_line; do
-            cfg_domain="${cfg_line%% -> *}"
-            if [ "$cfg_domain" = "$domain" ]; then
-                echo "错误：域名 ${domain} 已配置，请先用菜单 5 删除后再添加。"
-                return
-            fi
-        done < "$PROXY_CONFIG_FILE"
+    local domain=$1 upstream=$2 work cfg_line cfg_domain wanted rc port
+    validate_proxy_domain "$domain" || return 1
+    validate_remote_upstream "$upstream" || return 1
+    work=$(mktemp -d) || { echo "错误：无法创建配置暂存目录。"; return 1; }
+    if ! caddy_prepare_transaction "$work"; then
+        sudo rm -rf "$work"; return 1
     fi
-
-    # 检查 Caddyfile 是否备份过，没有则备份一下
-    if [ ! -f "$BACKUP_CADDYFILE" ]; then
-        sudo cp "$CADDYFILE" "$BACKUP_CADDYFILE"
+    wanted=${domain,,}; wanted=${wanted%.}
+    while IFS= read -r cfg_line || [ -n "$cfg_line" ]; do
+        [ -z "$cfg_line" ] && continue
+        cfg_domain=${cfg_line%% -> *}
+        cfg_domain=${cfg_domain,,}; cfg_domain=${cfg_domain%.}
+        if [ "$cfg_domain" = "$wanted" ]; then
+            echo "错误：域名 ${domain} 已配置，请先删除后再添加。"
+            sudo rm -rf "$work"; return 1
+        fi
+    done < "$work/original.registry"
+    caddy_site_span "$work/original.caddy" "$domain" check
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 10 ]; then echo "错误：当前 Caddyfile 已存在域名 ${domain}。"; fi
+        sudo rm -rf "$work"; return 1
     fi
-
-    # 添加新的反向代理配置到 Caddyfile
-    echo "配置反向代理：${domain} -> ${upstream}"
-    build_proxy_block "$domain" "$upstream" | sudo tee -a "$CADDYFILE" >/dev/null
-
-    # 将配置信息保存到代理配置列表文件
-    echo "${domain} -> ${upstream}" >> "$PROXY_CONFIG_FILE"
-
-    # 重启 Caddy 以应用配置
-    echo "正在重启 Caddy 服务以应用新配置..."
-    sudo systemctl restart caddy
-
-    # 检查上游服务状态
+    if ! {
+        if [ -s "$work/candidate.caddy" ] && [ -n "$(tail -c 1 "$work/candidate.caddy")" ]; then printf '\n'; fi
+        build_proxy_block "$domain" "$upstream"
+    } >> "$work/candidate.caddy"; then
+        echo "错误：生成候选配置失败。"; sudo rm -rf "$work"; return 1
+    fi
+    if ! {
+        if [ -s "$work/candidate.registry" ] && [ -n "$(tail -c 1 "$work/candidate.registry")" ]; then printf '\n'; fi
+        printf '%s -> %s\n' "$domain" "$upstream"
+    } >> "$work/candidate.registry"; then
+        echo "错误：生成候选注册表失败。"; sudo rm -rf "$work"; return 1
+    fi
+    caddy_commit_transaction "$work" || return 1
+    echo "反向代理配置成功：${domain} -> ${upstream}"
     if upstream_is_loopback "$upstream"; then
         port=$(loopback_port "$upstream")
         echo "上游服务（127.0.0.1:${port}）状态：$(check_port_running "$port")"
     else
         echo "上游网址（${upstream}）状态：$(check_remote_upstream "$upstream")"
     fi
-    echo "Caddy 服务状态："
-    sudo systemctl status caddy --no-pager
+    return 0
 }
 
 #--------------------------------------------
 # 配置反向代理：反代本地端口（输入域名及上游服务端口）
 #--------------------------------------------
 function setup_reverse_proxy() {
+    local domain port
     echo "请输入域名（例如 example.com）："
-    read domain
-    if [ -z "$domain" ]; then
-        echo "域名输入不能为空。"
-        return
-    fi
-
+    IFS= read -r domain || { echo "输入结束，已取消。"; return 1; }
+    validate_proxy_domain "$domain" || return 1
     while true; do
         echo "请输入上游服务端口（例如 8080）："
-        read port
-        if [ -z "$port" ]; then
-            echo "端口输入不能为空。"
-            return
-        fi
-        if ! [[ "$port" =~ ^[0-9]{1,5}$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            echo "错误：端口必须是 1-65535 之间的数字（例如 8080），请重新输入。"
+        IFS= read -r port || { echo "输入结束，已取消。"; return 1; }
+        if ! valid_proxy_port "$port"; then
+            echo "错误：端口必须是 1-65535 之间的数字，请重新输入。"
             continue
         fi
         break
     done
-
     apply_reverse_proxy "$domain" "http://127.0.0.1:${port}"
 }
 
@@ -344,31 +542,19 @@ function setup_reverse_proxy() {
 # 配置反向代理：反代远程网址（输入域名及远程网址）
 #--------------------------------------------
 function setup_reverse_proxy_remote() {
-    local upstream=""
-    local err=""
-
+    local domain upstream err
     echo "请输入域名（例如 example.com）："
-    read domain
-    if [ -z "$domain" ]; then
-        echo "域名输入不能为空。"
-        return
-    fi
-
+    IFS= read -r domain || { echo "输入结束，已取消。"; return 1; }
+    validate_proxy_domain "$domain" || return 1
     while true; do
         echo "请输入远程网址（必须带 http:// 或 https:// 前缀，例如 https://target.example.com）："
-        read upstream || { echo "输入结束，已取消。"; return; }
-        if [ -z "$upstream" ]; then
-            echo "远程网址输入不能为空。"
-            continue
-        fi
-        err=$(validate_remote_upstream "$upstream")
-        if [ -n "$err" ]; then
+        IFS= read -r upstream || { echo "输入结束，已取消。"; return 1; }
+        if ! err=$(validate_remote_upstream "$upstream"); then
             echo "$err"
             continue
         fi
         break
     done
-
     apply_reverse_proxy "$domain" "$upstream"
 }
 
@@ -419,10 +605,11 @@ function show_caddy_status() {
 # 查看反向代理配置，并显示上游服务状态
 #--------------------------------------------
 function show_reverse_proxies() {
+    local lineno line upstream port status
     if [ -f "$PROXY_CONFIG_FILE" ]; then
         echo "当前反向代理配置："
         lineno=0
-        while IFS= read -r line; do
+        while IFS= read -r line || [ -n "$line" ]; do
             # 行号与配置文件物理行号严格一致（删除功能按物理行号定位，不能跳号）
             lineno=$((lineno+1))
             # 空行直接跳过：既不必显示，也不能拿空串去探测
@@ -458,99 +645,66 @@ function show_reverse_proxies() {
 # 用法：remove_proxy_block <域名>
 # 说明：域名按字面比较（不用正则，域名里的 . 不会被当成通配），
 #       并按花括号深度找到配对的 }，因此远程块里 reverse_proxy 的嵌套 { } 也能正确处理；
-#       其余内容与顺序保持不变；找不到该块时只给提示、不报错。
+#       按原始字节保留目标外内容；找不到唯一目标或不能安全识别时返回失败。
 #--------------------------------------------
+function caddy_copy_without_range() {
+    local source=$1 candidate=$2 begin=$3 end=$4
+    [[ "$begin" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] && [ "$end" -ge "$begin" ] || return 1
+    { head -c "$begin" "$source" && tail -c "+$((end + 1))" "$source"; } > "$candidate"
+}
+
 function remove_proxy_block() {
-    local domain=$1
-    local srcfile tmpfile line trimmed
-    local in_block=0 depth=0 removed=0 braces_open braces_close
-
-    if [ ! -f "$CADDYFILE" ]; then
-        echo "Caddyfile 不存在（${CADDYFILE}），已跳过。"
-        return
-    fi
-
-    srcfile=$(mktemp) || return 1
-    tmpfile=$(mktemp) || { rm -f "$srcfile"; return 1; }
-
-    # 读取当前 Caddyfile（Caddyfile 属 root 时用 sudo 拷出来读）
-    if ! cp "$CADDYFILE" "$srcfile" 2>/dev/null; then
-        if ! sudo cp "$CADDYFILE" "$srcfile" 2>/dev/null; then
-            echo "无法读取 Caddyfile（${CADDYFILE}），已跳过。"
-            rm -f "$srcfile" "$tmpfile"
-            return
+    local domain=$1 source=${2:-} candidate=${3:-} work span begin end
+    validate_proxy_domain "$domain" || return 1
+    if [ "$#" -eq 1 ]; then
+        work=$(mktemp -d) || return 1
+        if ! caddy_prepare_transaction "$work" ||
+            ! remove_proxy_block "$domain" "$work/original.caddy" "$work/candidate.caddy"; then
+            sudo rm -rf "$work"; return 1
         fi
+        caddy_commit_transaction "$work"
+        return $?
     fi
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        if [ "$in_block" -eq 0 ]; then
-            # 只认行首（允许前导空白）精确为 "<域名> {" 的那一行
-            trimmed="${line#"${line%%[![:space:]]*}"}"
-            if [ "$trimmed" = "${domain} {" ] || [ "$trimmed" = "${domain}{" ]; then
-                in_block=1
-                depth=1
-                removed=1
-                continue
-            fi
-            printf '%s\n' "$line" >> "$tmpfile"
-        else
-            # 块内：按花括号深度找配对的 }（嵌套的 { } 一并计数）。
-            # 这里用 tr 计数而不是参数扩展：参数扩展里用 } 做字符类（${line//[^}]/}）
-            # 时，bash 会把那个 } 当成 ${...} 的结束符导致解析错位，实测结果是往
-            # 替换结果里多塞进一个 "]/}"，于是删除后会残留一个孤立的 }。
-            braces_open=$(printf '%s' "$line" | tr -cd '{' | wc -c)
-            braces_close=$(printf '%s' "$line" | tr -cd '}' | wc -c)
-            depth=$((depth + braces_open - braces_close))
-            if [ "$depth" -le 0 ]; then
-                in_block=0
-            fi
-        fi
-    done < "$srcfile"
-
-    if [ "$removed" -eq 1 ]; then
-        if ! cp "$tmpfile" "$CADDYFILE" 2>/dev/null; then
-            sudo cp "$tmpfile" "$CADDYFILE"
-        fi
-    else
-        echo "Caddyfile 中未找到域名 ${domain} 的配置块，已跳过。"
-    fi
-
-    rm -f "$srcfile" "$tmpfile"
+    [ "$#" -eq 3 ] && [ -f "$source" ] || return 1
+    span=$(caddy_site_span "$source" "$domain" delete) || return 1
+    read -r begin end <<< "$span"
+    caddy_copy_without_range "$source" "$candidate" "$begin" "$end"
 }
 
 #--------------------------------------------
 # 删除指定的反向代理
 #--------------------------------------------
 function delete_reverse_proxy() {
-    local target_domain
+    local proxy_number work line target_domain span begin end size
     show_reverse_proxies
     echo "请输入要删除的反向代理配置编号："
-    read proxy_number
-    if [ -z "$proxy_number" ]; then
-        echo "无效的输入。"
-        return
+    IFS= read -r proxy_number || { echo "输入结束，已取消。"; return 1; }
+    if [[ ! "$proxy_number" =~ ^[0-9]{1,9}$ ]] || (( 10#$proxy_number < 1 )); then
+        echo "错误：请输入有效的数字编号。"; return 1
     fi
-
-    # 先取出该编号对应的域名，用于稍后从 Caddyfile 里按块删除
-    target_domain=$(sed -n "${proxy_number}p" "$PROXY_CONFIG_FILE" | awk -F' -> ' '{print $1}')
-    if [ -z "$target_domain" ]; then
-        echo "配置文件中没有第 ${proxy_number} 行，已跳过。"
-        return
+    proxy_number=$((10#$proxy_number))
+    work=$(mktemp -d) || return 1
+    if ! caddy_prepare_transaction "$work"; then sudo rm -rf "$work"; return 1; fi
+    line=$(sed -n "${proxy_number}p" "$work/original.registry")
+    if [[ "$line" != *" -> "* ]]; then
+        echo "错误：该编号不存在或注册表行格式不正确。"; sudo rm -rf "$work"; return 1
     fi
-
-    # 删除配置列表里对应的行
-    sed -i "${proxy_number}d" "$PROXY_CONFIG_FILE"
-
-    # 只从当前 Caddyfile 里删除这一个域名的 site 块。
-    # 注意：这里不再从 .bak 整体恢复再把剩余块重新追加 —— 那会把用户在脚本外
-    # 对 Caddyfile 做的改动（自己加的站点、注释等）一起回滚掉。
-    echo "正在从 Caddyfile 中删除 ${target_domain} 的配置块..."
-    remove_proxy_block "$target_domain"
-
-    # 重启 Caddy 服务
-    echo "重启 Caddy 服务..."
-    sudo systemctl restart caddy
+    target_domain=${line%% -> *}
+    if ! remove_proxy_block "$target_domain" "$work/original.caddy" "$work/candidate.caddy"; then
+        echo "错误：未能安全删除目标，配置和注册表未改动。"; sudo rm -rf "$work"; return 1
+    fi
+    size=$(wc -c < "$work/original.registry") || { sudo rm -rf "$work"; return 1; }
+    span=$(LC_ALL=C awk -v selected="$proxy_number" -v total="$size" '
+        BEGIN { offset=0 }
+        { end=offset+length($0); if (end<total) end++; if (NR==selected) print offset,end; offset=end }
+    ' "$work/original.registry")
+    read -r begin end <<< "$span"
+    if ! caddy_copy_without_range "$work/original.registry" "$work/candidate.registry" "$begin" "$end"; then
+        echo "错误：生成候选注册表失败。"; sudo rm -rf "$work"; return 1
+    fi
+    caddy_commit_transaction "$work" || return 1
     echo "反向代理删除成功！"
+    return 0
 }
 
 #--------------------------------------------
