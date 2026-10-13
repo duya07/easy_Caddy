@@ -17,12 +17,18 @@ if [ "${EASY_CADDY_TEST_MODE:-0}" = 1 ]; then
     CERT_STATE_DIR=${CERT_STATE_DIR:-/etc/easy-caddy/certificates}
     CERT_WORKER_INSTALL_DIR=${CERT_WORKER_INSTALL_DIR:-/usr/local/lib/easy-caddy}
     CERT_SYSTEMD_UNIT_DIR=${CERT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}
+    DEPENDENCY_STATE_DIR=${DEPENDENCY_STATE_DIR:-/var/lib/easy-caddy/dependencies}
+    LOG_MANAGER_STATE_DIR=${LOG_MANAGER_STATE_DIR:-/var/lib/easy-caddy/logs}
+    LOG_SYSTEMD_UNIT_DIR=${LOG_SYSTEMD_UNIT_DIR:-/etc/systemd/system}
 else
     CADDYFILE=/etc/caddy/Caddyfile
     PROXY_CONFIG_FILE=/root/caddy_reverse_proxies.txt
     CERT_STATE_DIR=/etc/easy-caddy/certificates
     CERT_WORKER_INSTALL_DIR=/usr/local/lib/easy-caddy
     CERT_SYSTEMD_UNIT_DIR=/etc/systemd/system
+    DEPENDENCY_STATE_DIR=/var/lib/easy-caddy/dependencies
+    LOG_MANAGER_STATE_DIR=/var/lib/easy-caddy/logs
+    LOG_SYSTEMD_UNIT_DIR=/etc/systemd/system
     unset CERT_STORAGE_DIR_OVERRIDE CADDY_SERVICE_HOME_OVERRIDE CADDY_SERVICE_XDG_DATA_HOME_OVERRIDE
 fi
 CADDY_CONFIG_DIR=$(dirname -- "$CADDYFILE")
@@ -591,33 +597,6 @@ function setup_reverse_proxy_remote() {
 #--------------------------------------------
 # 反向代理二级菜单
 #--------------------------------------------
-function reverse_proxy_menu() {
-    while true; do
-        echo "============================================="
-        echo "           配置 & 启用反向代理                "
-        echo "============================================="
-        echo " 1) 反代本地端口（域名 -> http://127.0.0.1:端口）"
-        echo " 2) 反代远程网址（域名 -> https://目标网址）"
-        echo " 0) 返回"
-        echo "============================================="
-        read -p "请输入选项: " proxy_opt || return
-        case "$proxy_opt" in
-            1)
-                setup_reverse_proxy
-                ;;
-            2)
-                setup_reverse_proxy_remote
-                ;;
-            0)
-                return
-                ;;
-            *)
-                echo "无效选项，请重新输入。"
-                ;;
-        esac
-        echo
-    done
-}
 
 #--------------------------------------------
 # 查看 Caddy 服务状态
@@ -783,28 +762,694 @@ function remove_caddy() {
 #--------------------------------------------
 # 显示菜单（顶部显示 Caddy 运行状态）
 #--------------------------------------------
-function show_menu() {
-    echo "============================================="
-    # 显示 Caddy 运行状态
-    caddy_status=$(systemctl is-active caddy 2>/dev/null)
-    if [ "$caddy_status" == "active" ]; then
-        echo "Caddy 状态：运行中"
+# 终端菜单视觉层：只定义函数，不在顶层执行。
+# 颜色仅在 stdout 为真实 TTY、NO_COLOR 未设置（含空值）且 TERM 非 dumb 时启用；
+# 其余情况输出纯文本（无 ANSI）。版面按 40 列终端设计，不依赖特殊字体。
+
+# 当前 stdout 是否启用 ANSI 颜色
+ui_color_enabled() {
+    [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != "dumb" ]
+}
+
+# ui_paint <sgr> <text>：不换行输出；颜色关闭或 sgr 为空时输出纯文本
+ui_paint() {
+    if [ -n "$1" ] && ui_color_enabled; then
+        printf '\033[%sm%s\033[0m' "$1" "$2"
     else
-        echo "Caddy 状态：未运行"
+        printf '%s' "$2"
     fi
-    echo "           Caddy 一键部署 & 管理脚本          "
-    echo "============================================="
-    echo " 1) 安装 Caddy（如已安装则跳过）"
-    echo " 2) 配置 & 启用反向代理（反代本地端口 / 远程网址）"
-    echo " 3) 查看 Caddy 服务状态"
-    echo " 4) 查看当前反向代理配置（显示上游服务状态）"
-    echo " 5) 删除指定的反向代理"
-    echo " 6) 重启 Caddy 服务"
-    echo " 7) 卸载 Caddy（删除配置）"
-    echo " 8) 证书管理（查看/复制目录/异步同步/日志）"
-    echo " 9) 手动编辑 Caddy 配置（候选校验及事务应用）"
-    echo " 0) 退出"
-    echo "============================================="
+}
+
+# ui_say <sgr> <text>：带换行输出
+ui_say() {
+    ui_paint "$1" "$2"
+    printf '\n'
+}
+
+# ui_rule <sgr> <char>：36 列分隔线（ASCII，宽度固定，CJK 宽字符环境也不换行）
+ui_rule() {
+    local i line=''
+    for ((i = 0; i < 36; i++)); do
+        line+="$2"
+    done
+    ui_say "$1" "$line"
+}
+
+# ui_header <标题>：顶部标题块（上下双线 + 空行）
+ui_header() {
+    ui_rule '36' '='
+    ui_say '1;36' "  $1"
+    ui_rule '36' '='
+    printf '\n'
+}
+
+# ui_group <分组名>：分组标题
+ui_group() {
+    printf '  '
+    ui_say '1' "$1"
+}
+
+# ui_item <编号> <标签> [说明] [标签 SGR]：选项行，形如 "    N) 标签"
+ui_item() {
+    printf '    '
+    ui_paint '36' "$1)"
+    printf ' '
+    ui_paint "${4:-}" "$2"
+    if [ -n "${3:-}" ]; then
+        printf '  '
+        ui_paint '2' "$3"
+    fi
+    printf '\n'
+}
+
+# ui_sub <说明>：选项下方的暗色缩进说明行
+ui_sub() {
+    printf '       '
+    ui_say '2' "$1"
+}
+
+# ui_ask <提示>：输入提示文字（不读取输入）
+ui_ask() {
+    ui_say '36' "$1"
+}
+
+# ui_warn <信息>：错误或无效输入提示
+ui_warn() {
+    ui_say '1;31' "$1"
+}
+
+#--------------------------------------------
+# 显示主菜单（顶部显示 Caddy 运行状态）
+#--------------------------------------------
+
+#--------------------------------------------
+# 反向代理二级菜单
+#--------------------------------------------
+
+#--------------------------------------------
+# 证书管理菜单
+#--------------------------------------------
+
+# Interactive page layer; business functions remain in the single-file script.
+ui_interactive() { [ -t 0 ] && [ -t 1 ]; }
+
+ui_page() {
+    if ui_interactive && [ "${TERM:-}" != dumb ]; then printf '\033[2J\033[H'; fi
+    ui_header "$1"
+}
+
+ui_pause() {
+    ui_interactive || return 0
+    local answer
+    printf '\n按回车返回菜单…'
+    IFS= read -r answer
+}
+
+certificate_context_state() {
+    local dest domains domain
+    certificate_controlled_path "$CERT_STATE_DIR" || return 1
+    if [ -e "$CERT_STATE_DIR/export-directory" ] || [ -L "$CERT_STATE_DIR/export-directory" ]; then
+        dest=$(certificate_read_directory) || return 1
+        printf '当前目的目录：%s\n' "$dest"
+    else
+        printf '当前目的目录：未设置\n'
+    fi
+    domains=$(certificate_read_domains) || return 1
+    printf '\n已登记域名与复制状态：\n'
+    if [ -z "$domains" ]; then printf '  无已登记域名；自动复制未登记。\n'
+    else
+        while IFS= read -r domain; do
+            printf '  %s  [已开启复制登记]\n' "$domain"
+        done <<< "$domains"
+    fi
+}
+
+certificate_available_domains() {
+    local domains line domain
+    domains=$(certificate_read_domains) || return 1
+    {
+        [ -z "$domains" ] || printf '%s\n' "$domains"
+        if [ -e "$PROXY_CONFIG_FILE" ] || [ -L "$PROXY_CONFIG_FILE" ]; then
+            certificate_safe_file "$PROXY_CONFIG_FILE" || return 1
+            while IFS= read -r line || [ -n "$line" ]; do
+                [[ "$line" == *' -> '* ]] || continue
+                domain=${line%% -> *}
+                validate_proxy_domain "$domain" >/dev/null 2>&1 || continue
+                domain=${domain,,}; domain=${domain%.}
+                printf '%s\n' "$domain"
+            done < "$PROXY_CONFIG_FILE"
+        fi
+        if certificate_safe_file "$CERT_STATE_DIR/sync.log"; then
+            awk 'match($0, /\[[^]]+\]/) {print substr($0, RSTART+1, RLENGTH-2)}' "$CERT_STATE_DIR/sync.log" |
+                while IFS= read -r domain; do
+                    validate_proxy_domain "$domain" >/dev/null 2>&1 && printf '%s\n' "$domain"
+                done
+        fi
+    } | sort -u
+}
+
+certificate_context_certificates() {
+    local root cert subject expiry count=0
+    if ! command -v caddy >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+        printf '\n已有证书：暂无法读取，请先在主菜单 2 检测并安装依赖。\n'
+        return 0
+    fi
+    root=$(certificate_storage_root) || return 1
+    printf '\n已有证书（storage：%s）：\n' "$root"
+    local -a candidates
+    mapfile -d '' -t candidates < <(certificate_candidates "$root")
+    wait "$!" || return 1
+    for cert in "${candidates[@]}"; do
+        count=$((count+1)); subject=${cert%/*}; subject=${subject##*/}
+        expiry=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null) || expiry='无法读取到期信息'
+        printf '  %s  %s\n' "$subject" "$expiry"
+    done
+    [ "$count" -gt 0 ] || printf '  无已签发证书（尚未签发或未发现）。\n'
+}
+
+certificate_overview() {
+    local scope=${1:-full} domains
+    certificate_context_state || return 1
+    case "$scope" in full|all) certificate_context_certificates || return 1 ;; esac
+    if [ "$scope" = logs ]; then
+        domains=$(certificate_available_domains) || return 1
+        printf '\n可查看日志的域名：\n'
+        if [ -n "$domains" ]; then printf '%s\n' "$domains"
+        else printf '  无可查看日志的域名。\n'; fi
+    fi
+    printf '\n'
+}
+
+certificate_select_domain() {
+    local scope=${1:-available} domains input domain index=0
+    CERT_SELECTED_DOMAIN=''
+    if [ "$scope" = registered ]; then domains=$(certificate_read_domains) || return 1
+    else domains=$(certificate_available_domains) || return 1; fi
+    local -a choices=()
+    if [ -n "$domains" ]; then
+        while IFS= read -r domain; do
+            choices+=("$domain"); index=$((index+1))
+            printf '  %s) %s\n' "$index" "$domain"
+        done <<< "$domains"
+    elif [ "$scope" = registered ]; then
+        printf '当前没有已登记域名，无需取消复制。\n'; return 1
+    else
+        printf '当前没有可选域名，可输入已有站点的域名。\n'
+    fi
+    printf '请选择域名编号或输入域名（0 取消）：\n'
+    IFS= read -r input || return 1
+    [ "$input" != 0 ] && [ -n "$input" ] || { printf '操作已取消。\n'; return 1; }
+    if [[ "$input" =~ ^[0-9]+$ ]] && [ "${#input}" -le 6 ]; then
+        index=$((10#$input))
+        if [ "$index" -ge 1 ] && [ "$index" -le "${#choices[@]}" ]; then input=${choices[index-1]}
+        else printf '域名编号无效。\n'; return 1; fi
+    fi
+    validate_proxy_domain "$input" || return 1
+    input=${input,,}; input=${input%.}
+    if [ "$scope" = registered ] && ! printf '%s\n' "$domains" | grep -Fxq -- "$input"; then
+        printf '该域名未登记复制。\n'; return 1
+    fi
+    CERT_SELECTED_DOMAIN=$input
+}
+
+function show_menu() {
+    local state_sgr state_text
+    caddy_status=$(systemctl is-active caddy 2>/dev/null)
+    if [ "$caddy_status" = active ]; then state_sgr='1;32'; state_text='运行中'
+    else state_sgr='1;31'; state_text='未运行'; fi
+    ui_page 'Caddy 一键部署与管理'
+    printf '  Caddy 状态：'; ui_say "$state_sgr" "$state_text"
+    printf '\n'
+    ui_group '部署与代理'
+    ui_item 1 '安装 Caddy' '（已装则跳过）'
+    ui_item 2 '依赖检测与安装'
+    ui_item 3 '配置反向代理'
+    printf '\n'
+    ui_group '服务运维'
+    ui_item 4 '查看服务状态'
+    ui_item 5 '查看反代配置' '（含上游状态）'
+    ui_item 6 '删除反向代理' '' '1;31'
+    ui_item 7 '重启 Caddy 服务'
+    ui_item 8 '日志查看'
+    ui_item 9 '日志轮转设置'
+    printf '\n'
+    ui_group '维护'
+    ui_item 10 '卸载 Caddy' '（删除配置）' '1;31'
+    ui_item 11 '依赖卸载' '（默认仅新增）' '1;31'
+    ui_item 12 '证书管理' '（查看/同步/日志）'
+    ui_item 13 '手动编辑配置' '（先校验再应用）'
+    printf '\n'
+    ui_item 0 '退出'
+    ui_rule '2' '-'
+}
+
+function reverse_proxy_menu() {
+    local proxy_opt
+    while true; do
+        ui_page '配置 & 启用反向代理'
+        ui_item 1 '反代本地端口'
+        ui_sub '域名 -> http://127.0.0.1:端口'
+        ui_item 2 '反代远程网址'
+        ui_sub '域名 -> https://目标网址'
+        printf '\n'; ui_item 0 '返回'; ui_rule '2' '-'
+        read -p '请输入选项 > ' proxy_opt || return
+        case "$proxy_opt" in
+            1) ui_page '反代本地端口'; setup_reverse_proxy ;;
+            2) ui_page '反代远程网址'; setup_reverse_proxy_remote ;;
+            0) return 0 ;;
+            *) ui_page '选项提示'; ui_warn '无效选项，请重新输入。' ;;
+        esac
+        ui_pause || return 0
+    done
+}
+
+function certificate_menu() {
+    local option path
+    while true; do
+        ui_page '证书管理'
+        ui_item 1 '查看证书与登记状态'
+        ui_item 2 '设置/修改目的目录'
+        ui_item 3 '立即同步已登记域名'
+        ui_item 4 '查看域名日志'
+        ui_item 5 '登记现有域名并开启复制'
+        ui_item 6 '取消域名复制'
+        printf '\n'; ui_item 0 '返回'; ui_rule '2' '-'
+        printf '请选择 > '
+        IFS= read -r option || return 0
+        case "$option" in
+            1) ui_page '查看证书与登记状态'
+                certificate_context_state && list_certificates ;;
+            2) ui_page '设置/修改目的目录'
+                if certificate_overview state; then
+                    ui_ask '请输入绝对目的目录（空输入取消）：'
+                    IFS= read -r path || return 0
+                    if [ -n "$path" ]; then set_certificate_export_directory "$path"
+                    else printf '操作已取消。\n'; fi
+                fi ;;
+            3) ui_page '立即同步已登记域名'
+                certificate_overview full && sync_certificates ;;
+            4) ui_page '查看域名日志'
+                if certificate_overview logs && certificate_select_domain available; then
+                    certificate_show_logs "$CERT_SELECTED_DOMAIN"
+                fi ;;
+            5) ui_page '登记现有域名并开启复制'
+                if certificate_overview full && certificate_select_domain available; then
+                    certificate_collect_choice && certificate_after_proxy "$CERT_SELECTED_DOMAIN"
+                fi ;;
+            6) ui_page '取消域名复制'
+                if certificate_overview state && certificate_select_domain registered; then
+                    unregister_certificate_export "$CERT_SELECTED_DOMAIN" &&
+                        printf '复制登记已取消：%s\n' "$CERT_SELECTED_DOMAIN"
+                fi ;;
+            0) return 0 ;;
+            *) ui_page '选项提示'; ui_warn '无效选项。' ;;
+        esac
+        ui_pause || return 0
+    done
+}
+
+# Debian/Ubuntu dependency ownership; records are data, never shell code.
+dependency_manifest() {
+    cat <<'PACKAGES'
+curl|curl
+gnupg|gpg
+jq|jq
+openssl|openssl
+util-linux|flock
+coreutils|realpath stat date sha256sum cp mv cmp mktemp install timeout tee cat chmod mkdir sort head tail cut tr readlink wc
+findutils|find
+grep|grep
+sed|sed
+mawk|awk
+sudo|sudo
+ca-certificates|
+logrotate|logrotate
+gzip|gzip
+PACKAGES
+}
+
+dependency_package_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9-]+)?$ ]]; }
+
+dependency_installed() {
+    local status
+    status=$(dpkg-query -W -f='${db:Status-Status}\n' -- "$1" 2>/dev/null) || return 1
+    [ "$status" = installed ]
+}
+
+dependency_related_packages() {
+    local package tools
+    while IFS='|' read -r package tools; do printf '%s\n' "$package"; done < <(dependency_manifest)
+}
+
+dependency_report() {
+    local package tools tool available broken=0
+    DEPENDENCY_MISSING_PACKAGES=()
+    command -v dpkg-query >/dev/null 2>&1 || { certificate_error '需要 Debian/Ubuntu 的 dpkg-query。'; return 1; }
+    printf '脚本依赖检测（仅安装缺失项）：\n'
+    while IFS='|' read -r package tools; do
+        available=1
+        for tool in $tools; do command -v "$tool" >/dev/null 2>&1 || available=0; done
+        [ -n "$tools" ] || { dependency_installed "$package" || available=0; }
+        if [ "$available" -eq 1 ]; then printf '  已安装  %s\n' "$package"
+        elif dependency_installed "$package"; then
+            printf '  异常    %s（包已安装但命令不可用，未重复安装）\n' "$package"; broken=1
+        else
+            printf '  缺失    %s\n' "$package"; DEPENDENCY_MISSING_PACKAGES+=("$package")
+        fi
+    done < <(dependency_manifest)
+    if command -v caddy >/dev/null 2>&1; then printf '  已安装  Caddy（由安装/卸载 Caddy 菜单管理）\n'
+    else printf '  缺失    Caddy（请使用主菜单 1 安装）\n'; fi
+    printf '\n'
+    [ "$broken" -eq 0 ]
+}
+
+dependency_safe_record() {
+    local mode
+    certificate_safe_file "$1" || return 1
+    mode=$(stat -c %a -- "$1") || return 1
+    [ "$(stat -c %u -- "$1")" = 0 ] && (( (8#$mode & 0022) == 0 ))
+}
+
+dependency_prepare_state() {
+    local file
+    [ "$EUID" -eq 0 ] || { certificate_error '依赖管理需要 root。'; return 1; }
+    command -v apt-get >/dev/null 2>&1 && command -v flock >/dev/null 2>&1 || {
+        certificate_error '依赖管理需要 apt-get 和 flock。'; return 1;
+    }
+    certificate_controlled_path "$DEPENDENCY_STATE_DIR" || return 1
+    if [ -e "$DEPENDENCY_STATE_DIR" ]; then
+        [ -d "$DEPENDENCY_STATE_DIR" ] && [ "$(stat -c %u -- "$DEPENDENCY_STATE_DIR")" = 0 ] || return 1
+    else mkdir -p -m 700 -- "$DEPENDENCY_STATE_DIR" || return 1; fi
+    for file in installed-packages pending-before pending-plan lock; do
+        if [ -e "$DEPENDENCY_STATE_DIR/$file" ] || [ -L "$DEPENDENCY_STATE_DIR/$file" ]; then
+            dependency_safe_record "$DEPENDENCY_STATE_DIR/$file" || { certificate_error "依赖记录不安全：$file"; return 1; }
+        fi
+    done
+    chmod 700 -- "$DEPENDENCY_STATE_DIR"
+}
+
+dependency_read_owned() {
+    local package file=$DEPENDENCY_STATE_DIR/installed-packages
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then return 0; fi
+    dependency_safe_record "$file" || { certificate_error '安装归属记录不安全。'; return 1; }
+    while IFS= read -r package || [ -n "$package" ]; do
+        [ -n "$package" ] || continue
+        dependency_package_name "$package" || { certificate_error '安装记录包含无效包名。'; return 1; }
+        printf '%s\n' "$package"
+    done < "$file"
+}
+
+dependency_snapshot() {
+    local records
+    records=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\t${Essential}\t${Protected}\n') || return 1
+    printf '%s\n' "$records" | awk -F '\t' '$2 == "installed" {print $1}' | LC_ALL=C sort -u > "$1" || return 1
+    chmod 600 -- "$1"
+}
+
+dependency_save_owned() {
+    local stage
+    stage=$(mktemp "$DEPENDENCY_STATE_DIR/.owned.XXXXXX") || return 1
+    if ! LC_ALL=C sort -u -- "$1" > "$stage" || ! chmod 600 -- "$stage" || ! mv -f -- "$stage" "$DEPENDENCY_STATE_DIR/installed-packages"; then
+        rm -f -- "$stage"; certificate_error '依赖安装归属记录保存失败。'; return 1
+    fi
+}
+
+dependency_pending_clear() { rm -f -- "$DEPENDENCY_STATE_DIR/pending-before" "$DEPENDENCY_STATE_DIR/pending-plan"; }
+
+dependency_no_pending() {
+    if [ -e "$DEPENDENCY_STATE_DIR/pending-before" ] || [ -e "$DEPENDENCY_STATE_DIR/pending-plan" ]; then
+        certificate_error "发现未完成的安装事务。请核对 $DEPENDENCY_STATE_DIR/pending-before 与 pending-plan；为避免误归属，本次不自动认领或卸载现有包。"
+        return 1
+    fi
+}
+
+dependency_install_menu() (
+    umask 077
+    local answer package plan before after rc=0 owned actual stage lock_fd
+    dependency_report || return 1
+    [ "${#DEPENDENCY_MISSING_PACKAGES[@]}" -gt 0 ] || { printf '所有依赖已满足，无需安装；已有包归属保持不变。\n'; return 0; }
+    printf '本次仅安装以下缺失项：\n'; printf '  %s\n' "${DEPENDENCY_MISSING_PACKAGES[@]}"
+    printf '确认安装？[y/yes，默认 n]：\n'
+    IFS= read -r answer || return 0
+    case "${answer,,}" in y|yes) ;; *) printf '操作已取消。\n'; return 0 ;; esac
+    dependency_prepare_state || return 1
+    exec {lock_fd}> "$DEPENDENCY_STATE_DIR/lock" || return 1
+    flock -x -w 30 "$lock_fd" || { certificate_error '依赖管理锁暂忙。'; return 1; }
+    dependency_no_pending || return 1
+    stage=$(mktemp -d "$DEPENDENCY_STATE_DIR/.transaction.XXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    dependency_report || return 1
+    [ "${#DEPENDENCY_MISSING_PACKAGES[@]}" -gt 0 ] || { printf '缺失项已由其他操作安装，本次未新增归属。\n'; return 0; }
+    apt-get update || { certificate_error '软件包索引更新失败，未安装。'; return 1; }
+    dependency_snapshot "$stage/before" || return 1
+    plan=$(LC_ALL=C apt-get --simulate --no-remove --no-install-recommends install -- "${DEPENDENCY_MISSING_PACKAGES[@]}") || return 1
+    if printf '%s\n' "$plan" | grep -q '^Remv '; then certificate_error '安装计划包含移除，已拒绝。'; return 1; fi
+    printf '%s\n' "$plan" | awk '$1 == "Inst" {print $2}' | LC_ALL=C sort -u > "$stage/plan"
+    while IFS= read -r package; do dependency_package_name "$package" || return 1; done < "$stage/plan"
+    printf '\nAPT 本次安装计划（含所需传递依赖）：\n'; cat -- "$stage/plan"
+    install -m 600 -- "$stage/before" "$DEPENDENCY_STATE_DIR/pending-before" &&
+        install -m 600 -- "$stage/plan" "$DEPENDENCY_STATE_DIR/pending-plan" || return 1
+    apt-get --no-remove --no-install-recommends install -y -- "${DEPENDENCY_MISSING_PACKAGES[@]}" || rc=$?
+    dependency_snapshot "$stage/after" || { certificate_error '安装后状态读取失败；保留事务快照。'; return 1; }
+    owned=$(dependency_read_owned) || return 1
+    printf '%s\n' "$owned" | sed '/^$/d' > "$stage/owned"
+    LC_ALL=C comm -13 "$stage/before" "$stage/after" > "$stage/new"
+    local -A planned=()
+    while IFS= read -r package; do planned["${package%%:*}"]=1; done < "$stage/plan"
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        if [ "${planned[${package%%:*}]:-0}" = 1 ]; then
+            printf '%s\n' "$package" >> "$stage/owned"
+            printf '已记录本功能新安装：%s\n' "$package"
+        fi
+    done < "$stage/new"
+    dependency_save_owned "$stage/owned" || return 1
+    dependency_pending_clear || return 1
+    if [ "$rc" -ne 0 ]; then certificate_error '安装未全部成功，已记录实际成功安装的新包。'; return "$rc"; fi
+    printf '依赖安装完成；原有依赖未记为本功能安装。\n'
+)
+
+dependency_protected() {
+    local flags base=${1%%:*}
+    case "$base" in bash|apt|dpkg|systemd|systemd-sysv|coreutils|findutils|grep|sed|mawk|gawk|util-linux|libc6) return 0 ;; esac
+    flags=$(dpkg-query -W -f='${Essential}\t${Protected}\n' -- "$1" 2>/dev/null) || return 0
+    [[ "$flags" == *yes* ]]
+}
+
+dependency_uninstall_menu() (
+    umask 077
+    local choice answer owned candidates package plan rc=0 stage lock_fd
+    printf '依赖卸载范围：\n 1) 仅本功能新安装并记录的依赖（默认）\n 2) 全部相关可卸载依赖（包括原有依赖）\n 0) 取消\n'
+    IFS= read -r choice || return 0
+    case "$choice" in ''|1) choice=1 ;; 2) ;; 0) return 0 ;; *) certificate_error '无效卸载范围。'; return 1 ;; esac
+    dependency_prepare_state || return 1
+    exec {lock_fd}> "$DEPENDENCY_STATE_DIR/lock" || return 1
+    flock -x -w 30 "$lock_fd" || return 1
+    dependency_no_pending || return 1
+    owned=$(dependency_read_owned) || return 1
+    if [ "$choice" = 1 ]; then candidates=$owned
+    else candidates=$(printf '%s\n%s\n' "$(dependency_related_packages)" "$owned" | sed '/^$/d' | LC_ALL=C sort -u); fi
+    local -a selected=()
+    local -A allowed=()
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        dependency_installed "$package" || continue
+        if dependency_protected "$package"; then printf '保留系统基础/受保护包：%s\n' "$package"; continue; fi
+        selected+=("$package"); allowed["${package%%:*}"]=1
+    done <<< "$candidates"
+    [ "${#selected[@]}" -gt 0 ] || { printf '本次范围内没有可卸载依赖。\n'; return 0; }
+    plan=$(LC_ALL=C apt-get --simulate -o APT::Get::AutomaticRemove=false remove -- "${selected[@]}") || return 1
+    local -a removals=()
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        dependency_package_name "$package" || return 1
+        if [ "${allowed[${package%%:*}]:-0}" != 1 ] || dependency_protected "$package"; then
+            printf 'APT 还将移除清单外或受保护的包：%s\n' "$package"
+            certificate_error '该卸载计划超出范围，已停止；没有卸载任何包。'; return 1
+        fi
+        removals+=("$package")
+    done < <(printf '%s\n' "$plan" | awk '$1 == "Remv" {print $2}')
+    [ "${#removals[@]}" -gt 0 ] || { printf 'APT 没有需要移除的项目。\n'; return 0; }
+    printf '\n本次将卸载的具体项目：\n'; printf '  %s\n' "${removals[@]}"
+    printf '只执行上述清单，不运行 autoremove。确认卸载？[y/yes，默认 n]：\n'
+    IFS= read -r answer || return 0
+    case "${answer,,}" in y|yes) ;; *) printf '操作已取消。\n'; return 0 ;; esac
+    stage=$(mktemp -d "$DEPENDENCY_STATE_DIR/.uninstall.XXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    apt-get -o APT::Get::AutomaticRemove=false remove -y -- "${removals[@]}" || rc=$?
+    : > "$stage/owned"
+    while IFS= read -r package; do
+        [ -n "$package" ] || continue
+        dependency_installed "$package" && printf '%s\n' "$package" >> "$stage/owned"
+    done <<< "$owned"
+    dependency_save_owned "$stage/owned" || return 1
+    if [ "$rc" -ne 0 ]; then certificate_error '卸载未全部成功；未卸载的安装记录已保留。'; return "$rc"; fi
+    printf '依赖卸载完成；未选中的原有依赖保持不变。\n'
+)
+
+# Log views and dedicated rotation of easy_Caddy-owned files.
+log_file_view() {
+    local file=$1
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then printf '暂无日志（文件尚未生成）。\n'; return 0; fi
+    certificate_safe_file "$file" || { certificate_error '日志不是安全普通文件。'; return 1; }
+    if [ -s "$file" ]; then tail -n 200 -- "$file"
+    else printf '暂无日志（文件为空）。\n'; fi
+}
+
+log_journal_view() {
+    local output
+    output=$(journalctl -u "$1" --no-pager -n 200 2>&1) || { certificate_error "日志读取失败：$output"; return 1; }
+    if [ -n "$output" ]; then printf '%s\n' "$output"
+    else printf '暂无服务日志。\n'; fi
+}
+
+logs_menu() {
+    local option
+    while true; do
+        ui_page '日志查看'
+        ui_item 1 'Caddy 服务日志'
+        ui_item 2 '证书同步文件日志'
+        ui_item 3 '证书同步任务日志'
+        ui_item 4 '按域名查看日志'
+        printf '\n'; ui_item 0 '返回'; ui_rule '2' '-'
+        printf '请选择 > '
+        IFS= read -r option || return 0
+        case "$option" in
+            1) ui_page 'Caddy 服务日志'; log_journal_view caddy ;;
+            2) ui_page '证书同步文件日志'; log_file_view "$CERT_STATE_DIR/sync.log" ;;
+            3) ui_page '证书同步任务日志'; log_journal_view easy-caddy-cert-sync ;;
+            4) ui_page '按域名查看日志'
+                if certificate_overview logs && certificate_select_domain available; then certificate_show_logs "$CERT_SELECTED_DOMAIN"; fi ;;
+            0) return 0 ;;
+            *) ui_page '选项提示'; ui_warn '无效日志选项。' ;;
+        esac
+        ui_pause || return 0
+    done
+}
+
+log_rotation_safe_file() {
+    local mode
+    if [ ! -e "$1" ] && [ ! -L "$1" ]; then return 0; fi
+    certificate_safe_file "$1" || return 1
+    mode=$(stat -c %a -- "$1") || return 1
+    [ "$(stat -c %u -- "$1")" = 0 ] && (( (8#$mode & 0022) == 0 ))
+}
+
+log_rotation_paths() {
+    local path
+    for path in "$LOG_MANAGER_STATE_DIR" "$LOG_SYSTEMD_UNIT_DIR" "$CERT_STATE_DIR"; do
+        certificate_absolute_path "$path" >/dev/null && certificate_controlled_path "$path" || return 1
+    done
+    for path in "$LOG_MANAGER_STATE_DIR/logrotate.conf" "$LOG_MANAGER_STATE_DIR/period" "$LOG_MANAGER_STATE_DIR/logrotate.status" "$LOG_MANAGER_STATE_DIR/rotation.lock" \
+                "$LOG_SYSTEMD_UNIT_DIR/easy-caddy-logrotate.service" "$LOG_SYSTEMD_UNIT_DIR/easy-caddy-logrotate.timer" "$CERT_STATE_DIR/sync.log"; do
+        log_rotation_safe_file "$path" || { certificate_error "日志轮转对象不安全：$path"; return 1; }
+    done
+}
+
+log_rotation_show() {
+    local period='未设置' state='未启用' value
+    log_rotation_paths || return 1
+    if [ -e "$LOG_MANAGER_STATE_DIR/period" ]; then
+        value=$(cat -- "$LOG_MANAGER_STATE_DIR/period") || return 1
+        case "$value" in daily) period='每天' ;; weekly) period='每周' ;; monthly) period='每月' ;; *) certificate_error '轮转周期记录无效。'; return 1 ;; esac
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet easy-caddy-logrotate.timer; then state='运行中'; fi
+    printf '当前轮转周期：%s\n定时检查：%s（每小时检查）\n' "$period" "$state"
+    printf '保留：14 份；大小上限触发：10 MiB。\n轮转文件：%s/sync.log\n' "$CERT_STATE_DIR"
+    printf 'Caddy/任务服务日志继续使用 journald 的现有保留策略；本设置管理脚本文件日志。\n\n'
+    command -v logrotate >/dev/null 2>&1 || printf '缺少 logrotate，请先通过主菜单 2 安装依赖。\n'
+}
+
+log_rotation_quote() {
+    local value=$1
+    value=${value//\\/\\\\}; value=${value//\"/\\\"}
+    printf '"%s"' "$value"
+}
+
+log_rotation_unit_quote() {
+    local value=$1
+    value=${value//%/%%}
+    log_rotation_quote "$value"
+}
+
+log_rotation_atomic_file() {
+    local stage
+    stage=$(mktemp "${2}.stage.XXXXXX") || return 1
+    if ! install -m 600 -- "$1" "$stage" || ! mv -f -- "$stage" "$2"; then rm -f -- "$stage"; return 1; fi
+}
+
+log_rotation_apply() (
+    umask 077
+    local period=$1 binary stage lock_fd path name was_active=0 restore_failed=0
+    case "$period" in daily|weekly|monthly) ;; *) certificate_error '轮转周期只支持 daily、weekly、monthly。'; return 1 ;; esac
+    [ "$EUID" -eq 0 ] || { certificate_error '日志轮转设置需要 root。'; return 1; }
+    binary=$(command -v logrotate) || { certificate_error '缺少 logrotate，请先在主菜单 2 安装依赖。'; return 1; }
+    binary=$(readlink -f -- "$binary") || return 1
+    [[ "$binary" == /* && ! "$binary" =~ [[:cntrl:]] ]] || return 1
+    command -v systemctl >/dev/null 2>&1 || { certificate_error '需要 systemd 执行定时轮转。'; return 1; }
+    log_rotation_paths || return 1
+    mkdir -p -m 700 -- "$LOG_MANAGER_STATE_DIR" || return 1
+    [ "$(stat -c %u -- "$LOG_MANAGER_STATE_DIR")" = 0 ] || return 1
+    exec {lock_fd}> "$LOG_MANAGER_STATE_DIR/rotation.lock" || return 1
+    flock -x -w 30 "$lock_fd" || return 1
+    log_rotation_paths || return 1
+    stage=$(mktemp -d "$LOG_MANAGER_STATE_DIR/.rotation.XXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    {
+        log_rotation_quote "$CERT_STATE_DIR/sync.log"; printf ' {\n    %s\n    rotate 14\n    maxsize 10M\n    missingok\n    notifempty\n    compress\n    delaycompress\n    copytruncate\n    su root root\n}\n' "$period"
+    } > "$stage/logrotate.conf" || return 1
+    if ! "$binary" --debug --state "$LOG_MANAGER_STATE_DIR/logrotate.status" "$stage/logrotate.conf" > "$stage/validation.log" 2>&1; then
+        certificate_error '轮转配置校验失败；未启用。'; cat -- "$stage/validation.log" >&2; return 1
+    fi
+    {
+        printf '[Unit]\nDescription=Rotate easy_Caddy file logs\n\n[Service]\nType=oneshot\nUser=root\nUMask=0077\n'
+        printf 'ExecStart='; log_rotation_unit_quote "$binary"
+        printf ' --state '; log_rotation_unit_quote "$LOG_MANAGER_STATE_DIR/logrotate.status"
+        printf ' '; log_rotation_unit_quote "$LOG_MANAGER_STATE_DIR/logrotate.conf"; printf '\n'
+    } > "$stage/easy-caddy-logrotate.service" || return 1
+    printf '[Unit]\nDescription=Check easy_Caddy log rotation hourly\n\n[Timer]\nOnCalendar=hourly\nPersistent=true\nAccuracySec=1min\nUnit=easy-caddy-logrotate.service\n\n[Install]\nWantedBy=timers.target\n' > "$stage/easy-caddy-logrotate.timer" || return 1
+    printf '%s\n' "$period" > "$stage/period"
+    mkdir -p -m 700 -- "$LOG_SYSTEMD_UNIT_DIR" || return 1
+    local -a names=(logrotate.conf period easy-caddy-logrotate.service easy-caddy-logrotate.timer)
+    local -a targets=("$LOG_MANAGER_STATE_DIR/logrotate.conf" "$LOG_MANAGER_STATE_DIR/period" "$LOG_SYSTEMD_UNIT_DIR/easy-caddy-logrotate.service" "$LOG_SYSTEMD_UNIT_DIR/easy-caddy-logrotate.timer")
+    local i failed=0
+    for i in "${!targets[@]}"; do
+        if [ -e "${targets[i]}" ]; then cp -p -- "${targets[i]}" "$stage/original-${names[i]}" || return 1; fi
+    done
+    systemctl is-active --quiet easy-caddy-logrotate.timer && was_active=1
+    for i in "${!targets[@]}"; do
+        log_rotation_atomic_file "$stage/${names[i]}" "${targets[i]}" || { failed=1; break; }
+    done
+    if [ "$failed" -eq 0 ]; then
+        systemctl daemon-reload && systemctl enable --now easy-caddy-logrotate.timer || failed=1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        if [ "$was_active" -eq 0 ]; then
+            systemctl stop easy-caddy-logrotate.timer >/dev/null 2>&1 || :
+            systemctl disable easy-caddy-logrotate.timer >/dev/null 2>&1 || :
+        fi
+        for i in "${!targets[@]}"; do
+            if [ -e "$stage/original-${names[i]}" ]; then cp -p -- "$stage/original-${names[i]}" "${targets[i]}" || restore_failed=1
+            else rm -f -- "${targets[i]}" || restore_failed=1; fi
+        done
+        systemctl daemon-reload >/dev/null 2>&1 || restore_failed=1
+        if [ "$was_active" -eq 1 ]; then systemctl restart easy-caddy-logrotate.timer >/dev/null 2>&1 || restore_failed=1; fi
+        if [ "$restore_failed" -eq 0 ]; then certificate_error '轮转设置未启用，已恢复原设置。'
+        else certificate_error '轮转设置失败，恢复未全部成功，请检查管理文件和专用 timer。'; fi
+        return 1
+    fi
+    printf '日志轮转已启用：%s；每小时检查，14 份，超过 10 MiB 提前轮转。\n' "$period"
+)
+
+log_rotation_menu() {
+    local choice period answer
+    log_rotation_show || return 1
+    printf '请选择轮转周期：\n 1) 每天\n 2) 每周\n 3) 每月\n 0) 返回\n'
+    IFS= read -r choice || return 0
+    case "$choice" in 1) period=daily ;; 2) period=weekly ;; 3) period=monthly ;; 0|'') return 0 ;; *) certificate_error '无效轮转周期。'; return 1 ;; esac
+    printf '将轮转 %s/sync.log，保留14份，大小触发10MiB，周期%s。\n确认应用？[y/yes，默认 n]：\n' "$CERT_STATE_DIR" "$period"
+    IFS= read -r answer || return 0
+    case "${answer,,}" in y|yes) log_rotation_apply "$period" ;; *) printf '操作已取消。\n' ;; esac
 }
 
 #--------------------------------------------
@@ -1407,38 +2052,23 @@ function certificate_after_proxy() {
 }
 
 function certificate_show_logs() {
-    local domain=$1 output
+    local domain=$1 output file_output='' journal_output=''
     validate_proxy_domain "$domain" >/dev/null || return 1
     domain=${domain,,}; domain=${domain%.}
-    if [ -f "$CERT_STATE_DIR/sync.log" ] && [ ! -L "$CERT_STATE_DIR/sync.log" ]; then
-        tail -n 200 -- "$CERT_STATE_DIR/sync.log" | grep -F -- "[$domain]" || :
+    if [ -e "$CERT_STATE_DIR/sync.log" ] || [ -L "$CERT_STATE_DIR/sync.log" ]; then
+        certificate_safe_file "$CERT_STATE_DIR/sync.log" || { certificate_error '同步日志不是安全普通文件。'; return 1; }
+        file_output=$(tail -n 200 -- "$CERT_STATE_DIR/sync.log" | grep -F -- "[$domain]" || :)
     fi
     output=$(journalctl -u caddy -u easy-caddy-cert-sync --no-pager -n 200 2>&1) || {
         certificate_error "journal 读取失败：$output"; return 1;
     }
-    printf '%s\n' "$output" | grep -F -- "$domain" || :
+    journal_output=$(printf '%s\n' "$output" | grep -F -- "$domain" || :)
+    printf '域名日志：%s\n' "$domain"
+    [ -z "$file_output" ] || printf '%s\n' "$file_output"
+    [ -z "$journal_output" ] || printf '%s\n' "$journal_output"
+    [ -n "$file_output$journal_output" ] || printf '该域名暂无日志。\n'
 }
 
-function certificate_menu() {
-    local option path domain
-    while true; do
-        printf '\n证书管理\n 1) 查看证书、复制目录及登记状态\n 2) 设置/修改目的目录\n 3) 立即同步已登记域名\n 4) 查看域名日志\n 5) 登记现有域名并开启复制\n 6) 取消域名复制\n 0) 返回\n'
-        IFS= read -r option || return 0
-        case "$option" in
-            1) list_certificates ;;
-            2) printf '请输入绝对目的目录：\n'; IFS= read -r path || return 0; set_certificate_export_directory "$path" ;;
-            3) sync_certificates ;;
-            4) printf '请输入域名：\n'; IFS= read -r domain || return 0; certificate_show_logs "$domain" ;;
-            5) printf '请输入已配置域名：\n'; IFS= read -r domain || return 0
-                validate_proxy_domain "$domain" || continue
-                certificate_collect_choice || continue
-                certificate_after_proxy "$domain" ;;
-            6) printf '请输入域名：\n'; IFS= read -r domain || return 0; unregister_certificate_export "$domain" ;;
-            0) return 0 ;;
-            *) printf '无效选项。\n' ;;
-        esac
-    done
-}
 
 #--------------------------------------------
 # 手动编辑：唯一备份、候选文件、独立 validate、锁下提交/reload/恢复
@@ -1591,50 +2221,28 @@ fi
 #--------------------------------------------
 while true; do
     show_menu
-    read -p "请输入选项: " opt || break
+    read -p '请输入选项: ' opt || break
     case "$opt" in
-        1)
-            if check_caddy_installed; then
-                echo "Caddy 已安装，跳过安装。"
-            else
-                install_caddy
+        1) ui_page '安装 Caddy'
+            if check_caddy_installed; then printf 'Caddy 已安装，跳过安装。\n'
+            else install_caddy; fi ;;
+        2) ui_page '依赖检测与安装'; dependency_install_menu ;;
+        3) if ! check_caddy_installed; then
+                ui_page '安装 Caddy'; printf 'Caddy 未安装，先执行安装步骤。\n'; install_caddy
             fi
-            ;;
-        2)
-            if ! check_caddy_installed; then
-                echo "Caddy 未安装，先执行安装步骤。"
-                install_caddy
-            fi
-            reverse_proxy_menu
-            ;;
-        3)
-            show_caddy_status
-            ;;
-        4)
-            show_reverse_proxies
-            ;;
-        5)
-            delete_reverse_proxy
-            ;;
-        6)
-            restart_caddy
-            ;;
-        7)
-            remove_caddy
-            ;;
-        8)
-            certificate_menu
-            ;;
-        9)
-            manual_edit_caddyfile
-            ;;
-        0)
-            echo "退出脚本。"
-            exit 0
-            ;;
-        *)
-            echo "无效选项，请重新输入。"
-            ;;
+            reverse_proxy_menu; continue ;;
+        4) ui_page 'Caddy 服务状态'; show_caddy_status ;;
+        5) ui_page '当前反向代理配置'; show_reverse_proxies ;;
+        6) ui_page '删除反向代理'; delete_reverse_proxy ;;
+        7) ui_page '重启 Caddy 服务'; restart_caddy ;;
+        8) logs_menu; continue ;;
+        9) ui_page '日志轮转设置'; log_rotation_menu ;;
+        10) ui_page '卸载 Caddy'; remove_caddy ;;
+        11) ui_page '依赖卸载'; dependency_uninstall_menu ;;
+        12) certificate_menu; continue ;;
+        13) ui_page '手动编辑 Caddy 配置'; manual_edit_caddyfile ;;
+        0) printf '退出脚本。\n'; exit 0 ;;
+        *) ui_page '选项提示'; ui_warn '无效选项，请重新输入。' ;;
     esac
-    echo
+    ui_pause || break
 done

@@ -54,7 +54,7 @@ v2 的透明工具包装保持 Bash 动态锁描述符；每次运行先执行�
 
 覆盖范围：
 
-- 原主菜单和 8/9 的真实进程派发、source 安全、非交互同步 CLI / 未知 CLI；本地/远程反代的 yes、现有目录、新目录、no、空行、各阶段 EOF、重复域名、validate/reload/timer 安装失败。
+- 主菜单 12/13 的真实进程派发（原历史编号 8/9）、source 安全、非交互同步 CLI / 未知 CLI；本地/远程反代的 yes、现有目录、新目录、no、空行、各阶段 EOF、重复域名、validate/reload/timer 安装失败。
 - 真实 RSA/EC 公钥配对与 PEM 链字节保持、多 issuer 到期时间/签发时间/字典序选择、未签发 pending、过期/未来/错 SAN/错 key、续期更新和 unchanged 不重写。
 - 服务 HOME/XDG、含空格的定制 file_system root、服务停止、引用服务环境模板、adapt 失败、未知模块/策略 storage、不确定 HOME。未知模块与策略分支使用明确标注的 synthetic adapt JSON；其他发现案例执行真实 Caddy adapt。
 - 独立设置与登记、规范化/幂等、命令与控制字符注入、symlink/hardlink/所有者/不安全既有对象、源文件字节和权限保护、写入失败保持旧有效 pair、目录变更、不登记不导出、只关闭指定域名、同步与目录/登记变更的锁串行化。
@@ -102,3 +102,13 @@ python3 tests/regression.py --component caddy \
 用例模拟停止的 systemd unit 通过 `EnvironmentFile` 注入 `XDG_DATA_HOME`，用真实 Caddy `environ` 的 `AppDataDir` 作为正对照，要求 `certificate_storage_root` 明确非零诊断、不返回猜测的 HOME 根，并保持配置、登记、导出目录和 worker 不变。环境文件内容仅由测试夹具读取；产品不读取、source 或 eval 该文件。systemd 元数据仍为隔离 mock，不声称已验证正式 systemd unit 部署。
 
 修复对停服默认根采用保守拒绝：`EnvironmentFiles` 非空或查询失败时明确失败；服务运行时仍读取可信进程环境，停止态的 literal storage root 不受此默认根检查影响。
+
+## 管理页面、依赖归属与日志轮转
+
+`operations.py` 在 Linux 独立 `/tmp` 树运行。包管理、systemctl 和 journalctl 使用隔离模拟；记录文件、证书夹具、PTY、logrotate 文件大小/周期判断/归档压缩使用真实工具。传入真实 logrotate 可执行文件或已验证的私有解包包装器：
+
+```bash
+python3 tests/operations.py --script /tmp/PRIVATE/easyCaddy.sh --evidence-dir /tmp/PRIVATE/management-tests --logrotate-bin /usr/sbin/logrotate
+```
+
+覆盖主菜单新编号、交互清屏与结果暂停、非交互/source；新增安装归属、重复执行、部分失败、取消、默认/全部范围和连带移除拒绝；证书已有信息/空状态先于输入；统一日志与空提示；daily/weekly/monthly 的真实大小和时间轮转、归档压缩、配置启用失败恢复及不安全日志路径拒绝。不会实际安装/卸载测试主机的系统包或更改生产服务。原证书套件仅随主菜单要求把派发 8/9 更新为 12/13、编号存在性更新为 1–13，其他断言保持；旧 Caddy 回归不变。

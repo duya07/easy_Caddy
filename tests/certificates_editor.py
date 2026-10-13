@@ -622,15 +622,15 @@ def source_safe(c):
 def menus(c):
     result = c.invoke('show_menu')
     output = c.operation_output(result)
-    for number in range(1, 10):
+    for number in range(1, 14):
         c.require(re.search(r'(?m)^\s*' + str(number) + r'[.)、）]', output) is not None, 'main menu is missing option ' + str(number))
     c.require('证书' in output and '编辑' in output, 'main menu must name certificate management and editing')
     # Both new dispatches are executed in actual script processes, bounded by EOF.
-    view = c.execute(['bash', c.product], '8\n')
-    c.require(view.returncode == 0 and '无效选项' not in view.stdout, 'menu option 8 did not dispatch/return safely at EOF')
-    edit = c.execute(['bash', c.product], '9\n')
-    c.require(edit.returncode == 0 and (c.root / 'editor-trace.txt').exists(), 'menu option 9 did not invoke the candidate editor')
-    c.require(c.config.read_bytes() == (c.root / 'candidate.caddy').read_bytes(), 'menu option 9 did not apply edited candidate')
+    view = c.execute(['bash', c.product], '12\n')
+    c.require(view.returncode == 0 and '无效选项' not in view.stdout, 'menu option 12 did not dispatch/return safely at EOF')
+    edit = c.execute(['bash', c.product], '13\n')
+    c.require(edit.returncode == 0 and (c.root / 'editor-trace.txt').exists(), 'menu option 13 did not invoke the candidate editor')
+    c.require(c.config.read_bytes() == (c.root / 'candidate.caddy').read_bytes(), 'menu option 13 did not apply edited candidate')
     c.require(c.registry.read_bytes() == c.original_registry, 'menu editing changed old registry')
 
 

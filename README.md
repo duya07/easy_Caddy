@@ -3,17 +3,21 @@
 
 Caddy 一键部署 & 管理脚本  ==================
  1) 安装 Caddy（如已安装则跳过）
- 2) 配置 & 启用反向代理（反代本地端口 / 远程网址）
- 3) 查看 Caddy 服务状态
- 4) 查看当前反向代理配置
- 5) 删除指定的反向代理
- 6) 重启 Caddy 服务
- 7) 卸载 Caddy（删除配置）
- 8) 证书管理（查看、复制目录、按域名登记、立即同步、日志）
- 9) 手动编辑 Caddy 配置（候选校验和事务应用）
+ 2) 依赖检测与安装（仅安装缺失项）
+ 3) 配置 & 启用反向代理（反代本地端口 / 远程网址）
+ 4) 查看 Caddy 服务状态
+ 5) 查看当前反向代理配置
+ 6) 删除指定的反向代理
+ 7) 重启 Caddy 服务
+ 8) 日志查看（Caddy、证书同步、按域名）
+ 9) 日志轮转设置
+ 10) 卸载 Caddy（删除配置）
+ 11) 依赖卸载（默认仅本功能新增项）
+ 12) 证书管理（查看、复制目录、按域名登记、立即同步、日志）
+ 13) 手动编辑 Caddy 配置（候选校验和事务应用）
  0) 退出
 
-菜单 2 为二级菜单，可选：
+菜单 3 为二级菜单，可选：
   1) 反代本地端口：域名 + 本地端口，上游为 http://127.0.0.1:端口
   2) 反代远程网址：域名 + 远程网址，上游为 http(s)://目标网址
      （必须带 http:// 或 https:// 前缀，不支持带路径 / 查询串 / 锚点）
@@ -35,11 +39,17 @@ Caddy 一键部署 & 管理脚本  ==================
 curl -o easyCaddy.sh https://raw.githubusercontent.com/duya07/easy_Caddy/refs/heads/main/easyCaddy.sh && chmod +x easyCaddy.sh && sudo bash ./easyCaddy.sh
 ```
 
-证书与编辑操作请以 root 执行。部署仍然只需下载这个 Bash 文件；使用脚本不需要 Python。证书管理需要 Caddy、jq、OpenSSL、flock（util-linux）和 GNU coreutils/findutils。菜单 1 的安装步骤会安装 jq、openssl、util-linux；直接使用证书菜单缺依赖时会明确报错，不在后台安装软件。
+证书与编辑操作请以 root 执行。部署仍然只需下载这个 Bash 文件；使用脚本不需要 Python。证书管理需要 Caddy、jq、OpenSSL、flock（util-linux）和 GNU coreutils/findutils。菜单 2 会显示脚本依赖的已安装/缺失状态，仅安装缺失项；直接使用证书菜单缺依赖时仍明确报错，不在后台安装软件。
+
+交互终端中，进入主菜单选项和子菜单操作时清理上一页，执行结果保留到按回车返回。非终端输入/输出不清屏、不增加暂停读取；`source` 和 `--sync-certificates` 保持非交互。`TERM=dumb` 不输出清屏控制码。
+
+依赖安装记录在 `/var/lib/easy-caddy/dependencies/installed-packages`，只记录本功能安装计划内、安装前不存在而安装后实际存在的包（包括必要传递依赖），重复执行不会把已有包重新认领。部分安装失败仍记录成功的新包；异常中断留下 pending 快照时会拒绝自动认领，提示先核对记录。菜单 11 默认只移除这些新增记录；可主动选择全部相关可卸载依赖。执行前先展示 APT 模拟的具体移除清单并确认，遇到清单外的连带移除则拒绝；不运行 `autoremove`，不默认移除 Caddy 或系统基础/Essential/Protected 包。已有包保留原归属。
+
+菜单 8 保留 Caddy 和证书同步任务 journal，以及同步文件和按域名日志，单次最多显示最近 200 行。菜单 9 可设置每天/每周/每月轮转，保存到 `/var/lib/easy-caddy/logs/`，并启用专用 `easy-caddy-logrotate.timer` 每小时检查。轮转对象为 `/etc/easy-caddy/certificates/sync.log`；保留 14 份，超过 10 MiB 提前轮转，旧文件压缩。配置先由 `logrotate --debug` 校验，写入或启用失败恢复原设置。使用 `copytruncate` 保持追加日志的文件身份，复制与截断之间存在 logrotate 文档所述的短暂并发写窗口。Caddy/任务服务 journal 继续使用系统现有保留策略，不改变全系统 journald。
 
 添加本地或远程反代时，在域名和上游之后询问是否复制该域名证书。`y`/`yes` 开启复制，`n`/`no` 或空行表示否。选择是会使用已保存的全局目的目录；尚未设置时当场输入绝对目录，如 `/srv/caddy-certificates` 或 `/srv/caddy certificates`。选择或目录输入遇到 EOF 取消整个新增流程。只有反代配置校验、提交并 reload 成功后才保存目录和登记；反代失败不会提前开启复制。已登记域名重新选择否会在反代成功后取消该域名登记，其他域名继续同步。
 
-菜单 8 可查看实际存储中的证书、issuer、起止有效期、证书及 key 完整路径、复制目的目录与域名登记；也可修改目录、立即同步、登记/取消已有域名、查看有界的域名日志。修改目录影响随后同步，旧目录的副本保留；仅设置目录不会复制所有证书或安装任务。外部手工 `tls` 加载的文件不属于本功能保证发现的自动 storage 证书。
+菜单 12 可查看实际存储中的证书、issuer、起止有效期、证书及 key 完整路径、复制目的目录与域名登记；也可修改目录、立即同步、登记/取消已有域名、查看有界的域名日志。每个操作页先展示相关当前目录、登记/复制状态、已有证书或可查询域名，空数据明确提示；域名操作支持从已有列表选编号或输入域名。修改目录影响随后同步，旧目录的副本保留；仅设置目录不会复制所有证书或安装任务。外部手工 `tls` 加载的文件不属于本功能保证发现的自动 storage 证书。
 
 存储发现使用运行 Caddy 的 HOME/XDG_DATA_HOME。Linux 默认数据目录为 `$XDG_DATA_HOME/caddy`，未设置时为 `$HOME/.local/share/caddy`；官方 systemd 服务通常是 `/var/lib/caddy/.local/share/caddy`。global `storage file_system` 的 root 使用 `caddy adapt` 的 JSON 解析，支持绝对路径和空格，以及能从运行进程解析的 `{env.VAR}`。Caddyfile `{$VAR}`、无法解析的占位符、未知 storage module、TLS policy storage 覆盖和无法确定的服务环境会明确拒绝导出。服务停止时可只读查找 literal root 或可信 unit/User 推断的默认目录，并标明未运行；相对 root 需运行进程 cwd。
 
@@ -58,7 +68,7 @@ sudo journalctl -u easy-caddy-cert-sync.service -n 100 --no-pager
 
 CLI 单次执行后退出、不进入菜单；指定域名仍须事先登记。取消最后一个域名时允许 timer 保留闲置，空登记 worker 直接返回 0、不扫描或创建文件。独立设置在 `/etc/easy-caddy/certificates/export-directory`（一行目录）与 `export-domains`（每行一个域名），新状态目录 0700、文件 0600。状态修改和 worker 共享 flock 锁。同步记录在 `sync.log`，菜单按域名显示最多最近 200 行，并过滤 Caddy/worker journal；记录不包含私钥正文。旧 `/root/caddy_reverse_proxies.txt` 的 `domain -> upstream` 格式保持。
 
-菜单 9 先在 Caddyfile 同目录创建唯一 `.manual-backup.<时间>.<随机后缀>` 备份，再在 0700 工作目录编辑候选。优先 `VISUAL`、其次 `EDITOR`，未设置时选择已安装的 nano/vi；允许 `vim -f` 一类简单 argv，拒绝需要 shell 引号、展开或命令拼接的值。编辑器未改内容/取消时不 validate/reload；编辑器失败或候选异常不写 live。保存后先用真实 `caddy validate`，再拿与自动反代共同的配置锁并检查原文件内容/身份。外部变动拒绝覆盖，坏草稿及日志保留并打印位置。通过后保持原 owner/mode 安全提交并 reload；reload 失败会恢复原件并尝试重新加载，恢复失败单独报告。手工站点不进入自动反代注册表，注册表保持原字节。
+菜单 13 先在 Caddyfile 同目录创建唯一 `.manual-backup.<时间>.<随机后缀>` 备份，再在 0700 工作目录编辑候选。优先 `VISUAL`、其次 `EDITOR`，未设置时选择已安装的 nano/vi；允许 `vim -f` 一类简单 argv，拒绝需要 shell 引号、展开或命令拼接的值。编辑器未改内容/取消时不 validate/reload；编辑器失败或候选异常不写 live。保存后先用真实 `caddy validate`，再拿与自动反代共同的配置锁并检查原文件内容/身份。外部变动拒绝覆盖，坏草稿及日志保留并打印位置。通过后保持原 owner/mode 安全提交并 reload；reload 失败会恢复原件并尝试重新加载，恢复失败单独报告。手工站点不进入自动反代注册表，注册表保持原字节。
 
 需要回滚手动编辑时，在下载的脚本所在目录执行下面命令，替换为脚本实际打印的备份绝对路径。它复用同一验证、备份、冲突保护和 reload/恢复事务，而不是直接覆盖 live：
 
