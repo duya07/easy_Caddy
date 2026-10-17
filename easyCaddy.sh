@@ -462,7 +462,13 @@ function caddy_validate_live_context() (
     validation=$(sudo mktemp "$(dirname -- "$CADDYFILE")/.easy-caddy-validate.XXXXXX") || return 1
     trap 'sudo rm -f -- "$validation"' EXIT
     sudo cp -- "$candidate" "$validation" || return 1
-    sudo caddy validate --adapter caddyfile --config "$validation"
+    local message
+    if message=$(sudo caddy validate --adapter caddyfile --config "$validation" 2>&1); then
+        printf '配置检查通过，Caddy 可以读取这份配置。\n'
+    else
+        printf '配置检查没有通过，原文件不会被替换。具体原因：\n%s\n' "$message" >&2
+        return 1
+    fi
 )
 
 function caddy_commit_transaction() (
@@ -567,7 +573,7 @@ function setup_reverse_proxy() {
         fi
         break
     done
-    certificate_collect_choice || return 1
+    certificate_collect_choice "$domain" || return 1
     apply_reverse_proxy "$domain" "http://127.0.0.1:${port}" || return 1
     certificate_after_proxy "$domain"
 }
@@ -589,7 +595,7 @@ function setup_reverse_proxy_remote() {
         fi
         break
     done
-    certificate_collect_choice || return 1
+    certificate_collect_choice "$domain" || return 1
     apply_reverse_proxy "$domain" "$upstream" || return 1
     certificate_after_proxy "$domain"
 }
@@ -870,7 +876,8 @@ certificate_context_state() {
     certificate_controlled_path "$CERT_STATE_DIR" || return 1
     if [ -e "$CERT_STATE_DIR/export-directory" ] || [ -L "$CERT_STATE_DIR/export-directory" ]; then
         dest=$(certificate_read_directory) || return 1
-        printf '当前目的目录：%s\n' "$dest"
+        printf '当前目的目录（父目录）：%s\n' "$dest"
+        printf '每个域名会自动追加一层子目录；这里只填写父目录。\n'
     else
         printf '当前目的目录：未设置\n'
     fi
@@ -880,6 +887,7 @@ certificate_context_state() {
     else
         while IFS= read -r domain; do
             printf '  %s  [已开启复制登记]\n' "$domain"
+            [ -z "${dest:-}" ] || printf '    最终文件：%s/%s/fullchain.pem\n              %s/%s/privkey.pem\n' "$dest" "$domain" "$dest" "$domain"
         done <<< "$domains"
     fi
 }
@@ -889,6 +897,7 @@ certificate_available_domains() {
     domains=$(certificate_read_domains) || return 1
     {
         [ -z "$domains" ] || printf '%s\n' "$domains"
+        certificate_automation_domains || return 1
         if [ -e "$PROXY_CONFIG_FILE" ] || [ -L "$PROXY_CONFIG_FILE" ]; then
             certificate_safe_file "$PROXY_CONFIG_FILE" || return 1
             while IFS= read -r line || [ -n "$line" ]; do
@@ -915,14 +924,15 @@ certificate_context_certificates() {
         return 0
     fi
     root=$(certificate_storage_root) || return 1
-    printf '\n已有证书（storage：%s）：\n' "$root"
+    printf '\n已有证书：\n'
     local -a candidates
     mapfile -d '' -t candidates < <(certificate_candidates "$root")
     wait "$!" || return 1
     for cert in "${candidates[@]}"; do
         count=$((count+1)); subject=${cert%/*}; subject=${subject##*/}
-        expiry=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null) || expiry='无法读取到期信息'
-        printf '  %s  %s\n' "$subject" "$expiry"
+        expiry=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null) || { printf '  %s：证书无法读取，请查看详细信息。\n' "$subject"; continue; }
+        expiry=$(date -d "${expiry#notAfter=}" +%s) || continue
+        printf '  %s：%s 到期。\n' "$subject" "$(certificate_ui_human_date "$expiry")"
     done
     [ "$count" -gt 0 ] || printf '  无已签发证书（尚未签发或未发现）。\n'
 }
@@ -979,6 +989,7 @@ function show_menu() {
     else state_sgr='1;31'; state_text='未运行'; fi
     ui_page 'Caddy 一键部署与管理'
     printf '  Caddy 状态：'; ui_say "$state_sgr" "$state_text"
+    certificate_main_summary
     printf '\n'
     ui_group '部署与代理'
     ui_item 1 '安装 Caddy' '（已装则跳过）'
@@ -1033,19 +1044,18 @@ function certificate_menu() {
         ui_item 4 '查看域名日志'
         ui_item 5 '登记现有域名并开启复制'
         ui_item 6 '取消域名复制'
+        ui_item 7 '申请证书' '（无需先配置反代）'
+        ui_item 8 '设置自动续签' '（开启/关闭/提前天数）'
+        ui_item 9 '查看技术详情' '（原始字段与诊断）'
+        ui_item 10 '等待域名证书签发'
         printf '\n'; ui_item 0 '返回'; ui_rule '2' '-'
         printf '请选择 > '
         IFS= read -r option || return 0
         case "$option" in
             1) ui_page '查看证书与登记状态'
-                certificate_context_state && list_certificates ;;
+                list_certificates ;;
             2) ui_page '设置/修改目的目录'
-                if certificate_overview state; then
-                    ui_ask '请输入绝对目的目录（空输入取消）：'
-                    IFS= read -r path || return 0
-                    if [ -n "$path" ]; then set_certificate_export_directory "$path"
-                    else printf '操作已取消。\n'; fi
-                fi ;;
+                certificate_set_directory_menu ;;
             3) ui_page '立即同步已登记域名'
                 certificate_overview full && sync_certificates ;;
             4) ui_page '查看域名日志'
@@ -1054,13 +1064,18 @@ function certificate_menu() {
                 fi ;;
             5) ui_page '登记现有域名并开启复制'
                 if certificate_overview full && certificate_select_domain available; then
-                    certificate_collect_choice && certificate_after_proxy "$CERT_SELECTED_DOMAIN"
+                    certificate_collect_choice "$CERT_SELECTED_DOMAIN" && certificate_after_proxy "$CERT_SELECTED_DOMAIN"
                 fi ;;
             6) ui_page '取消域名复制'
                 if certificate_overview state && certificate_select_domain registered; then
                     unregister_certificate_export "$CERT_SELECTED_DOMAIN" &&
                         printf '复制登记已取消：%s\n' "$CERT_SELECTED_DOMAIN"
                 fi ;;
+            7) ui_page '申请域名证书'; certificate_request_menu ;;
+            8) ui_page '设置自动续签'; certificate_renewal_menu ;;
+            9) ui_page '证书技术详情'; certificate_technical_details ;;
+            10) ui_page '等待证书签发'
+                certificate_select_domain available && certificate_watch_domain "$CERT_SELECTED_DOMAIN" ;;
             0) return 0 ;;
             *) ui_page '选项提示'; ui_warn '无效选项。' ;;
         esac
@@ -1585,7 +1600,7 @@ function certificate_storage_root() {
     pid=$(systemctl show caddy --property=MainPID --value 2>/dev/null) || pid=0
     [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
     if [ "$pid" -gt 0 ]; then
-        json=$(caddy_adapt_service_environment "$pid" "$CADDYFILE") || {
+        json=$(caddy_adapt_quiet caddy_adapt_service_environment "$pid" "$CADDYFILE") || {
             certificate_error '无法使用运行服务环境解析 Caddyfile/import，未扫描证书。'; return 1;
         }
     else
@@ -1595,7 +1610,7 @@ function certificate_storage_root() {
             certificate_error 'Caddy 服务未运行，无法可靠解析 Caddyfile/import 的服务环境；未扫描证书。'
             return 1
         fi
-        json=$(caddy adapt --adapter caddyfile --config "$CADDYFILE") || {
+        json=$(caddy_adapt_quiet caddy adapt --adapter caddyfile --config "$CADDYFILE") || {
             certificate_error 'Caddy adapt 失败，未扫描证书。'; return 1;
         }
     fi
@@ -1837,7 +1852,13 @@ function certificate_candidates() {
 function certificate_log() {
     local domain=$1 status=$2 detail=${3:-}
     printf '%s [%s] %s %s\n' "$(date -u +%FT%TZ)" "$domain" "$status" "$detail" >> "$CERT_STATE_DIR/sync.log"
-    printf '[%s] %s %s\n' "$domain" "$status" "$detail"
+    case "$status" in
+        synced) printf '%s：证书已复制完成，可以在目的目录中使用。\n' "$domain" ;;
+        already-current) printf '%s：副本已经是最新证书，无需重复复制。\n' "$domain" ;;
+        '待签发/未发现') printf '%s：还在等待证书签发，后台会继续检查。\n' "$domain" ;;
+        error) printf '%s：这次复制未完成，原有文件保留。%s\n' "$domain" "$detail" ;;
+        *) printf '%s：%s %s\n' "$domain" "$status" "$detail" ;;
+    esac
 }
 
 function certificate_sync_domain() {
@@ -1942,7 +1963,7 @@ function sync_certificates() (
     return "$failed"
 )
 
-function list_certificates() {
+function certificate_technical_details() {
     local root cert subject key issuer count=0 result domains domain dest
     certificate_dependencies || return 1
     root=$(certificate_storage_root) || return 1
@@ -1972,18 +1993,49 @@ function list_certificates() {
     fi
 }
 
+function list_certificates() {
+    local root domains known automated domain cert subject dest='' registered registered_domains
+    local -a candidates
+    certificate_dependencies || return 1
+    root=$(certificate_storage_root) || return 1
+    registered_domains=$(certificate_read_domains) || return 1
+    known=$(certificate_available_domains) || return 1
+    mapfile -d '' -t candidates < <(certificate_candidates "$root")
+    wait "$!" || return 1
+    domains=$known
+    for cert in "${candidates[@]}"; do
+        subject=${cert%/*}; subject=${subject##*/}
+        domains+=$'\n'$subject
+    done
+    domains=$(printf '%s\n' "$domains" | sed '/^$/d' | LC_ALL=C sort -u)
+    if [ -e "$CERT_STATE_DIR/export-directory" ] || [ -L "$CERT_STATE_DIR/export-directory" ]; then
+        dest=$(certificate_read_directory) || return 1
+        printf '证书复制父目录：%s（域名子目录由脚本自动追加）。\n' "$dest"
+    else printf '自动复制尚未设置父目录；这不影响 Caddy 自己申请和使用证书。\n'; fi
+    [ -n "$domains" ] || { printf '\n还没有可显示的证书或域名（待签发/未发现）；可以选择“申请证书”。\n'; return 0; }
+    while IFS= read -r domain; do
+        registered=no
+        if printf '%s\n' "$registered_domains" | grep -Fxq -- "$domain"; then registered=yes; fi
+        certificate_ui_domain_status "$root" "$domain" "$registered" "$dest" || return 1
+    done <<< "$domains"
+    printf '\n需要内部目录、原始日期或错误原因时，请选择“查看技术详情”或“查看域名日志”。\n'
+}
+
 function install_certificate_sync_timer() (
     umask 077
-    local domains script service timer lock_fd
+    local domains automated script service timer lock_fd worker_argument=--sync-certificates
     domains=$(certificate_read_domains) || return 1
-    [ -n "$domains" ] || return 0
+    automated=$(certificate_automation_domains) || return 1
+    [ -z "$automated" ] || worker_argument=--certificate-maintenance
+    [ -n "$domains$automated" ] || return 0
     [ "$EUID" -eq 0 ] || { certificate_error '安装自动同步需要 root。'; return 1; }
     command -v systemctl >/dev/null 2>&1 || { certificate_error 'systemd 不可用，自动同步未启用。'; return 1; }
     certificate_state_prepare || return 1
     exec {lock_fd}> "$CERT_STATE_DIR/sync.lock" || return 1
     flock -x -w 20 "$lock_fd" || return 1
     domains=$(certificate_read_domains) || return 1
-    [ -n "$domains" ] || return 0
+    automated=$(certificate_automation_domains) || return 1
+    [ -n "$domains$automated" ] || return 0
     certificate_controlled_path "$CERT_WORKER_INSTALL_DIR" && certificate_controlled_path "$CERT_SYSTEMD_UNIT_DIR" || return 1
     mkdir -p -m 700 -- "$CERT_WORKER_INSTALL_DIR" "$CERT_SYSTEMD_UNIT_DIR" || return 1
     script=$CERT_WORKER_INSTALL_DIR/easyCaddy.sh
@@ -2001,20 +2053,24 @@ function install_certificate_sync_timer() (
     escaped=${escaped//\\/\\\\}; escaped=${escaped//\"/\\\"}; escaped=${escaped//%/%%}
     {
         printf '[Unit]\nDescription=Synchronise opted-in Caddy leaf certificates\nAfter=caddy.service\n\n[Service]\nType=oneshot\nUser=root\nUMask=0077\n'
-        printf 'ExecStart=/bin/bash "%s" --sync-certificates\n' "$escaped"
+        printf 'ExecStart=/bin/bash "%s" %s\n' "$escaped" "$worker_argument"
     } > "$service" || return 1
     printf '[Unit]\nDescription=Check Caddy certificate exports each minute\n\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=1min\nAccuracySec=1s\nUnit=easy-caddy-cert-sync.service\n\n[Install]\nWantedBy=timers.target\n' > "$timer" || return 1
     chmod 600 -- "$service" "$timer" || return 1
-    if ! systemctl daemon-reload || ! systemctl enable --now easy-caddy-cert-sync.timer; then
-        certificate_error '自动同步未启用；反代及域名登记保留，可手动运行 --sync-certificates。'; return 1
+    local service_message
+    if ! service_message=$(systemctl daemon-reload 2>&1) || ! service_message=$(systemctl enable --now easy-caddy-cert-sync.timer 2>&1); then
+        certificate_error '后台证书检查没有启用。设置仍保留，可重试开启；立即同步仍可手动运行。'
+        printf '%s\n' "$service_message" >&2
+        return 1
     fi
-    printf '自动同步已启用：一分钟检查签发/续期（签发时间取决于 Caddy/CA）。\n'
+    printf '后台证书检查已开启：每分钟检查一次，签发或续签完成后会更新已登记的副本。\n'
+    printf '关闭此页面不会中断 Caddy 申请；也可以留在当前页面等待结果。\n'
 )
 
 # 只收集输入，数据由成功的反代事务之后提交。
 function certificate_collect_choice() {
     CERT_CHOICE=no; CERT_CHOSEN_DIRECTORY=''; CERT_DIRECTORY_IS_NEW=0
-    local answer path
+    local answer path domain=${1:-${CERT_SELECTED_DOMAIN:-example.com}} duplicate_answer
     while true; do
         printf '是否将该域名证书复制到指定目录？[y/yes，默认 n]：\n'
         IFS= read -r answer || { printf '输入结束，已取消。\n'; return 1; }
@@ -2023,11 +2079,20 @@ function certificate_collect_choice() {
     if [ -e "$CERT_STATE_DIR/export-directory" ]; then
         path=$(certificate_read_directory) || return 1
     else
-        printf '请输入证书目的目录（绝对路径，可含空格）：\n'
+        printf '请选择证书的父目录，脚本会自动在下面建立 %s 子目录。\n' "$domain"
+        printf '例如填 /root/cert，证书就会放在 /root/cert/%s/；不要再把域名填在父目录末尾。\n' "$domain"
+        printf '请输入证书父目录（绝对路径或 ~/，可含空格）：\n'
         IFS= read -r path || { printf '输入结束，已取消。\n'; return 1; }
         CERT_DIRECTORY_IS_NEW=1
     fi
+    path=$(certificate_normalize_destination_input "$path") || return 1
     CERT_CHOSEN_DIRECTORY=$(certificate_validate_destination "$path") || return 1
+    certificate_destination_preview "$CERT_CHOSEN_DIRECTORY" "$domain" || return 1
+    if [ "${CERT_CHOSEN_DIRECTORY##*/}" = "$domain" ]; then
+        printf '父目录末尾已经是域名，继续会重复一层。确定仍使用这个父目录？[y/yes，默认 n]：\n'
+        IFS= read -r duplicate_answer || return 1
+        case "${duplicate_answer,,}" in y|yes) ;; *) printf '已取消，请重新选择父目录。\n'; return 1 ;; esac
+    fi
 }
 
 function certificate_after_proxy() {
@@ -2036,7 +2101,8 @@ function certificate_after_proxy() {
         unregister_certificate_export "$domain" || {
             certificate_error '反代配置已应用，但旧证书登记取消失败。'; return 1;
         }
-        return 0
+        certificate_watch_domain "$domain"
+        return $?
     fi
     if [ "$CERT_DIRECTORY_IS_NEW" -eq 1 ]; then
         set_certificate_export_directory "$CERT_CHOSEN_DIRECTORY" || {
@@ -2049,6 +2115,7 @@ function certificate_after_proxy() {
     if [ "$failed" -ne 0 ]; then
         certificate_error '反代配置已应用，证书导出待完成/自动任务安装失败；登记保留供重试。'; return 1
     fi
+    certificate_watch_domain "$domain"
 }
 
 function certificate_show_logs() {
@@ -2204,6 +2271,515 @@ function manual_edit_caddyfile() (
     caddy_manual_commit "$work"
 )
 
+# Certificate automation uses Caddy's own issuer; export registration is independent.
+certificate_automation_domains() {
+    local directory=$CERT_STATE_DIR/automation file domain
+    [ -e "$directory" ] || { [ ! -L "$directory" ]; return $?; }
+    certificate_controlled_path "$directory" || return 1
+    for file in "$directory"/*; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        domain=${file##*/}
+        [[ "$domain" = .* ]] && continue
+        validate_proxy_domain "$domain" >/dev/null 2>&1 && certificate_safe_file "$file" || {
+            certificate_error '证书续签设置中有无法识别或不安全的记录，请先检查。'; return 1;
+        }
+        printf '%s\n' "$domain"
+    done
+}
+
+certificate_automation_read() {
+    local domain=$1 mode days phase extra file
+    validate_proxy_domain "$domain" >/dev/null || return 1
+    file=$CERT_STATE_DIR/automation/${domain,,}
+    [ -e "$file" ] || { [ ! -L "$file" ] && return 2; return 1; }
+    certificate_controlled_path "$CERT_STATE_DIR/automation" && certificate_safe_file "$file" || return 1
+    [ "$(stat -c %u -- "$file")" = 0 ] && [ "$(awk 'END {print NR}' "$file")" = 1 ] || return 1
+    read -r mode days phase extra < "$file" || return 1
+    case "$mode:$phase" in on:waiting|on:active|off:waiting|off:fixed) ;; *) return 1 ;; esac
+    [[ "$days" =~ ^[0-9]{1,3}$ ]] && [ -z "$extra" ] || return 1
+    if [ "$mode" = on ]; then [ "$days" -ge 1 ] && [ "$days" -le 365 ] || return 1
+    else [ "$days" = 0 ] || return 1; fi
+    printf '%s %s %s\n' "$mode" "$days" "$phase"
+}
+
+certificate_select_pair() {
+    local root=$1 domain=$2 cert times expires starts best='' best_end=0 best_start=0
+    local -a choices
+    mapfile -d '' -t choices < <(certificate_candidates "$root" "$domain")
+    wait "$!" || return 1
+    local fixed rule fixed_file
+    if rule=$(certificate_automation_read "$domain") && [[ "$rule" = 'off 0 fixed' ]]; then
+        fixed=$(dirname -- "$CADDYFILE")/easy-caddy-fixed/$domain
+        choices=()
+        for fixed_file in "$fixed"/.pair.*/"$domain.crt"; do
+            [ -f "$fixed_file" ] && choices+=("$fixed_file")
+        done
+    fi
+    for cert in "${choices[@]}"; do
+        times=$(certificate_pair_valid "$cert" "${cert%.crt}.key" "$domain" 2>/dev/null) || continue
+        read -r expires starts <<< "$times"
+        if [ -z "$best" ] || [ "$expires" -gt "$best_end" ] ||
+            { [ "$expires" -eq "$best_end" ] && [ "$starts" -gt "$best_start" ]; } ||
+            { [ "$expires" -eq "$best_end" ] && [ "$starts" -eq "$best_start" ] && [[ "$cert" < "$best" ]]; }; then
+            best=$cert; best_end=$expires; best_start=$starts
+        fi
+    done
+    [ -n "$best" ] || return 2
+    printf '%s\n' "$best"
+}
+
+certificate_renewal_ratio() {
+    local cert=$1 days=$2 first last lifetime
+    [[ "$days" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$days" -le 365 ] || {
+        certificate_error '请填写 1 到 365 之间的整数天数。'; return 1;
+    }
+    [ -n "$cert" ] || { printf '0.33333333\n'; return 0; }
+    first=$(openssl x509 -in "$cert" -noout -startdate 2>/dev/null) &&
+        last=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null) || return 1
+    first=$(date -d "${first#notBefore=}" +%s) && last=$(date -d "${last#notAfter=}" +%s) || return 1
+    lifetime=$((last-first))
+    [ "$lifetime" -gt "$((days*86400))" ] || {
+        certificate_error "提前 $days 天已达到或超过这张证书的总有效期，请选择更小的天数。"; return 1;
+    }
+    LC_ALL=C awk -v days="$days" -v seconds="$lifetime" 'BEGIN {printf "%.8f\n", days*86400/seconds}'
+}
+
+certificate_automation_describe() {
+    local domain=$1 rule mode days phase rc
+    rule=$(certificate_automation_read "$domain"); rc=$?
+    if [ "$rc" = 2 ]; then printf '自动续签：沿用 Caddy 原有设置（尚未在此单独设置）。\n'; return 0; fi
+    [ "$rc" = 0 ] || { certificate_error '暂时无法可靠读取此域名的续签设置。'; return 1; }
+    read -r mode days phase <<< "$rule"
+    if [ "$mode" = on ]; then
+        printf '自动续签：已开启，目标在到期前 %s 天进入续签窗口。\n' "$days"
+        [ "$phase" != waiting ] || printf '  首次签发后会按实际有效期换算；目前先使用 Caddy 默认窗口。\n'
+        printf '  CA 可能要求更早续签；服务和域名验证必须保持可用。\n'
+    elif [ "$phase" = fixed ]; then
+        printf '自动续签：已关闭，当前加载固定证书；到期前需要手动重新开启续签。\n'
+    else
+        printf '自动续签：已选择关闭；等待首次签发，完成后后台任务会切换为固定证书。\n'
+    fi
+}
+
+# Only the marked TLS segment is ours; the rest of the user's site is retained.
+certificate_fixed_copy() (
+    umask 077
+    local cert=$1 domain=$2 base stage key=${1%.crt}.key
+    base=$(dirname -- "$CADDYFILE")/easy-caddy-fixed/$domain
+    certificate_controlled_path "$base" || return 1
+    mkdir -p -m 755 -- "$base" || return 1
+    stage=$(mktemp -d "$base/.pair.XXXXXX") || return 1
+    if ! cp -- "$cert" "$stage/$domain.crt" || ! cp -- "$key" "$stage/$domain.key" ||
+        ! chmod 600 -- "$stage/$domain.crt" "$stage/$domain.key" ||
+        ! chown --reference="$key" -- "$stage" "$stage/$domain.crt" "$stage/$domain.key" ||
+        ! certificate_pair_valid "$stage/$domain.crt" "$stage/$domain.key" "$domain" >/dev/null; then
+        rm -rf -- "$stage"; certificate_error '固定证书副本未能安全保存，续签设置未改动。'; return 1
+    fi
+    printf '%s/%s.crt\n' "$stage" "$domain"
+)
+
+certificate_policy_candidate() {
+    local input=$1 output=$2 domain=$3 policy=$4 allow_new=${5:-no} span start finish total first status
+    caddy_site_span "$input" "$domain" check; status=$?
+    if [ "$status" = 10 ]; then
+        span=$(caddy_site_span "$input" "$domain" delete) || return 1
+        read -r start finish <<< "$span"
+        (set -o pipefail; head -c "$finish" -- "$input" | tail -c "$((finish-start))") > "$output.site" || return 1
+        IFS= read -r first < "$output.site" || return 1
+        if ! [[ "$first" =~ ^[[:space:]]*(https://)?${domain//./\.}[[:space:]]*\{[[:space:]]*$ ]]; then
+            certificate_error '这个站点的地址写法较复杂或仅启用了 HTTP，请用手动编辑调整 TLS；原配置保持不变。'; return 1
+        fi
+        LC_ALL=C awk -v domain="$domain" '
+            $0 == "    # easy-caddy-certificate-policy-begin " domain {if (inside || seen++) exit 9; inside=1; next}
+            $0 == "    # easy-caddy-certificate-policy-end " domain {if (!inside) exit 9; inside=0; next}
+            !inside {print}
+            END {if (inside) exit 9}
+        ' "$output.site" > "$output.clean" || { certificate_error '脚本管理的 TLS 标记不完整，未覆盖。'; return 1; }
+        if grep -Eq '^[[:space:]]*(tls|import)[[:space:]]' "$output.clean"; then
+            certificate_error '此站点已有手工 TLS 或 import 设置；为保留你的配置，请先在手动编辑中处理，未自动覆盖。'; return 1
+        fi
+        head -c "$start" -- "$input" > "$output" || return 1
+        {
+            IFS= read -r first
+            printf '%s\n    # easy-caddy-certificate-policy-begin %s\n' "$first" "$domain"
+            cat -- "$policy"
+            printf '    # easy-caddy-certificate-policy-end %s\n' "$domain"
+            cat
+        } < "$output.clean" >> "$output" || return 1
+        total=$(wc -c < "$input") || return 1
+        tail -c "$((total-finish))" -- "$input" >> "$output" || return 1
+    else
+        [ "$status" = 0 ] || return 1
+        [ "$allow_new" = yes ] || { certificate_error '没有找到可单独管理的站点；可先选择“申请证书”。'; return 1; }
+        if grep -Eq '(^|[[:space:],])\*\.[^[:space:]]+' "$input"; then
+            certificate_error '当前配置含通配域名，新增精确站点可能遮蔽原有内容；请用手动配置申请，原站点保持不变。'; return 1
+        fi
+        cat -- "$input" > "$output" || return 1
+        {
+            printf '\n%s {\n    # easy-caddy-certificate-policy-begin %s\n' "$domain" "$domain"
+            cat -- "$policy"
+            printf '    # easy-caddy-certificate-policy-end %s\n    respond "This host is managed for certificate issuance." 404\n}\n' "$domain"
+        } >> "$output" || return 1
+    fi
+}
+
+certificate_automation_set() (
+    umask 077
+    local domain=${1:-} mode=${2:-} days=${3:-30} origin=${4:-menu} root cert='' rule ratio phase
+    local directory lock_fd work file stage backup candidate_copy result old_rule saved_mode saved_days saved_phase keep_work=0 config_changed=0 restore_work
+    validate_proxy_domain "$domain" >/dev/null || return 1
+    domain=${domain,,}; domain=${domain%.}
+    case "$mode" in
+        on) [[ "$days" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$days" -le 365 ] || {
+                certificate_error '请填写 1 到 365 之间的整数天数。'; return 1; } ;;
+        off) days=0 ;;
+        *) certificate_error '续签选项无效，请选择开启或关闭。'; return 1 ;;
+    esac
+    if [ "$mode" = on ]; then
+        if ! printf 'probe.invalid {\n tls {\n renewal_window_ratio 0.33333333\n }\n respond "test"\n}\n' |
+            caddy adapt --adapter caddyfile --config - >/dev/null 2>&1; then
+            certificate_error '当前 Caddy 不支持设置续签窗口，请先更新 Caddy 后重试（已验证 2.11.7 支持，2.10.2 不支持）；原配置未改动。'
+            return 1
+        fi
+    fi
+    certificate_dependencies && certificate_state_prepare || return 1
+    directory=$CERT_STATE_DIR/automation
+    certificate_controlled_path "$directory" || return 1
+    [ -d "$directory" ] || mkdir -m 700 -- "$directory" || return 1
+    file=$directory/$domain
+    if [ -e "$file" ] || [ -L "$file" ]; then certificate_automation_read "$domain" >/dev/null || return 1; fi
+    for stage in "$CERT_STATE_DIR/automation.lock"; do
+        [ ! -e "$stage" ] && [ ! -L "$stage" ] || certificate_safe_file "$stage" || return 1
+    done
+    exec {lock_fd}> "$CERT_STATE_DIR/automation.lock" || return 1
+    flock -x -w 20 "$lock_fd" || { certificate_error '另一项证书设置正在保存，请稍后再试。'; return 1; }
+    # An old worker snapshot must not replace a concurrently changed user rule.
+    if [ "$origin" = maintenance ]; then
+        rule=$(certificate_automation_read "$domain") || return 1
+        read -r mode days phase <<< "$rule"
+    fi
+    # Once disabled, expiry or storage cleanup must never re-enable issuance.
+    if [ "$mode" = off ] && old_rule=$(certificate_automation_read "$domain"); then
+        read -r saved_mode saved_days saved_phase <<< "$old_rule"
+        if [ "$saved_mode:$saved_phase" = off:fixed ]; then
+            [ "$origin" = maintenance ] || certificate_automation_describe "$domain"
+            return 0
+        fi
+    fi
+    root=$(certificate_storage_root) || return 1
+    cert=$(certificate_select_pair "$root" "$domain"); result=$?
+    [ "$result" = 0 ] || [ "$result" = 2 ] || return 1
+    phase=waiting
+    if [ "$mode" = on ]; then
+        ratio=$(certificate_renewal_ratio "$cert" "$days") || return 1
+        [ -z "$cert" ] || phase=active
+    elif [ -n "$cert" ]; then
+        # A loaded SAN certificate would affect other sites too; refuse that scope.
+        if [ "$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -oE '(DNS:|IP Address:)[^,]+' | wc -l)" != 1 ]; then
+            certificate_error '当前证书覆盖多个域名，关闭其续签会影响其他站点，未自动修改。'; return 1
+        fi
+        phase=fixed
+    fi
+    work=$(mktemp -d "$(dirname -- "$CADDYFILE")/.easy-caddy-policy.XXXXXX") || return 1
+    trap 'case "${stage:-}" in "$directory"/.rule.*) rm -f -- "$stage";; esac; [ -z "${candidate_copy:-}" ] || rm -f -- "$candidate_copy"; if [ "$keep_work" = 0 ]; then rm -rf -- "$work"; fi' EXIT
+    caddy_config_lock || return 1
+    stat -c '%d:%i:%u:%g:%a:%s:%y:%z' -- "$CADDYFILE" > "$work/original.identity" &&
+        cp -p -- "$CADDYFILE" "$work/original.caddy" || return 1
+    flock -u "$CADDY_LOCK_FD"
+    exec {CADDY_LOCK_FD}<&-
+    if grep -Eq '^[[:space:]]*auto_https([[:space:]]+|$)' "$work/original.caddy"; then
+        certificate_error 'Caddyfile 已有全局 auto_https 自定义设置；请先手动核对，避免覆盖其签发意图。'; return 1
+    fi
+    if [ "$mode" = off ] && [ -n "$cert" ]; then
+        cert=$(certificate_fixed_copy "$cert" "$domain") || return 1
+        printf '    tls %s %s\n' "$(log_rotation_quote "$cert")" "$(log_rotation_quote "${cert%.crt}.key")" > "$work/policy"
+    elif [ "$mode" = on ]; then
+        printf '    tls {\n        renewal_window_ratio %s\n    }\n' "${ratio:-0.33333333}" > "$work/policy"
+    else
+        printf '    # Waiting for the first certificate before loading a fixed copy.\n' > "$work/policy"
+    fi
+    local allow_new=no
+    [ "$origin" != request ] || allow_new=yes
+    certificate_policy_candidate "$work/original.caddy" "$work/candidate.caddy" "$domain" "$work/policy" "$allow_new" || return 1
+    stage=$(mktemp "$directory/.rule.XXXXXX") || return 1
+    printf '%s %s %s\n' "$mode" "$days" "$phase" > "$stage" || return 1
+    candidate_copy=$(mktemp "$directory/.candidate.XXXXXX") || return 1
+    cp -- "$work/candidate.caddy" "$candidate_copy" || return 1
+    if cmp -s -- "$work/original.caddy" "$work/candidate.caddy"; then
+        rm -rf -- "$work"
+    else
+        backup=$(mktemp "${CADDYFILE}.manual-backup.$(date -u +%Y%m%dT%H%M%S).XXXXXX") || return 1
+        cp -p -- "$work/original.caddy" "$backup" && printf '%s\n' "$backup" > "$work/backup-path" || return 1
+        keep_work=1
+        if ! caddy_manual_commit "$work"; then rm -f -- "$candidate_copy"; return 1; fi
+        keep_work=0; config_changed=1
+    fi
+    if ! cmp -s -- "$stage" "$file"; then
+        if ! mv -fT -- "$stage" "$file"; then
+            if [ "$config_changed" = 0 ]; then
+                certificate_error '续签记录未能保存；配置原本无需修改，原文件和原设置保持不变。'
+            elif cmp -s -- "$candidate_copy" "$CADDYFILE"; then
+                certificate_error '续签记录未能保存，正在恢复原配置。'
+                restore_work=$(mktemp -d "$(dirname -- "$CADDYFILE")/.easy-caddy-policy-restore.XXXXXX") || return 1
+                stat -c '%d:%i:%u:%g:%a:%s:%y:%z' -- "$CADDYFILE" > "$restore_work/original.identity" &&
+                    cp -p -- "$CADDYFILE" "$restore_work/original.caddy" &&
+                    cp -- "$backup" "$restore_work/candidate.caddy" &&
+                    printf '%s\n' "$backup" > "$restore_work/backup-path" || return 1
+                flock -u "$CADDY_LOCK_FD"
+                exec {CADDY_LOCK_FD}<&-
+                caddy_manual_commit "$restore_work" || return 1
+            else certificate_error "配置另有变动，未覆盖；原配置备份：$backup"; fi
+            rm -f -- "$candidate_copy"; return 1
+        fi
+    fi
+    rm -f -- "$candidate_copy"
+    if [ "$origin" != maintenance ]; then
+        install_certificate_sync_timer || { certificate_error '续签设置已保存，但后台维护任务未启用，请重试；可暂时留在等待页面。'; return 1; }
+        certificate_automation_describe "$domain"
+    fi
+)
+
+certificate_automation_run() {
+    local domains domain rule mode days phase failed=0
+    domains=$(certificate_automation_domains) || return 1
+    [ -n "$domains" ] || return 0
+    while IFS= read -r domain; do
+        rule=$(certificate_automation_read "$domain") || { failed=1; continue; }
+        read -r mode days phase <<< "$rule"
+        certificate_automation_set "$domain" "$mode" "$days" maintenance || failed=1
+    done <<< "$domains"
+    return "$failed"
+}
+
+certificate_request() {
+    local domain=${1:-} mode=${2:-on} days=${3:-30}
+    certificate_automation_set "$domain" "$mode" "$days" request || return 1
+    printf '\n证书申请已交给 Caddy：%s。\n' "$domain"
+    printf '签发完成时间由域名验证和 CA 决定；已存在的有效证书会直接使用，不会重复强制申请。\n'
+}
+
+certificate_renewal_choice() {
+    local answer days
+    CERT_RENEWAL_MODE=on; CERT_RENEWAL_DAYS=30
+    printf '首次申请完成后，是否自动续签？[Y/n，回车开启]：\n'
+    IFS= read -r answer || return 1
+    case "${answer,,}" in
+        n|no) CERT_RENEWAL_MODE=off; CERT_RENEWAL_DAYS=0
+            printf '将仅申请这一次；首次签发后由后台任务切换为固定证书，之后需自行处理到期。\n'; return 0 ;;
+        y|yes|'') ;;
+        *) certificate_error '请输入 y/yes 或 n/no。'; return 1 ;;
+    esac
+    printf '希望在到期前多少天开始续签？[1–365，回车 30]：\n'
+    IFS= read -r days || return 1
+    days=${days:-30}
+    [[ "$days" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$days" -le 365 ] || { certificate_error '请输入 1 到 365 的整数。'; return 1; }
+    CERT_RENEWAL_DAYS=$days
+    printf '将按实际证书有效期换算为 Caddy 续签窗口；CA 的续签建议可能让时间更早。\n'
+}
+
+certificate_request_menu() {
+    local domain
+    printf '为域名申请证书，无需先配置反代。已有站点会保留原来的内容与上游。\n'
+    printf '请确保域名解析到本机，且 CA 能访问 80 或 443 端口；通配符及手工 DNS 验证请使用手动配置。\n\n'
+    ui_ask '请输入要申请证书的域名（空输入取消）：'
+    IFS= read -r domain || return 1
+    [ -n "$domain" ] || return 0
+    validate_proxy_domain "$domain" || return 1
+    domain=${domain,,}; domain=${domain%.}
+    certificate_renewal_choice && certificate_collect_choice "$domain" || return 1
+    certificate_request "$domain" "$CERT_RENEWAL_MODE" "$CERT_RENEWAL_DAYS" || return 1
+    certificate_after_proxy "$domain"
+}
+
+certificate_renewal_menu() {
+    certificate_overview state && certificate_select_domain available || return 1
+    certificate_automation_describe "$CERT_SELECTED_DOMAIN" || return 1
+    certificate_renewal_choice || return 1
+    certificate_automation_set "$CERT_SELECTED_DOMAIN" "$CERT_RENEWAL_MODE" "$CERT_RENEWAL_DAYS"
+}
+
+# Successful adapt warnings are diagnostics, never certificate states. Failed parses retain details.
+caddy_adapt_quiet() (
+    umask 077
+    local diagnostic code
+    diagnostic=$(mktemp) || return 1
+    trap 'rm -f -- "$diagnostic"' EXIT
+    "$@" 2> "$diagnostic"; code=$?
+    if [ "$code" -ne 0 ]; then
+        certificate_error 'Caddy 无法解析当前配置，暂时不能确认签发状态；请根据下方原因修正。'
+        tail -n 20 -- "$diagnostic" >&2
+    fi
+    return "$code"
+)
+
+# Human-facing certificate views. Raw engine details remain available explicitly.
+certificate_normalize_destination_input() {
+    local input=${1:-}
+    case "$input" in
+        '~'|'~/'*) [[ "${HOME:-}" = /* ]] || { certificate_error '当前用户的主目录不可用，请输入绝对路径。'; return 1; }
+            printf '%s\n' "$HOME${input#\~}" ;;
+        '~'*) certificate_error '只支持 ~ 或 ~/；其他用户的目录请填写完整路径。'; return 1 ;;
+        *) printf '%s\n' "$input" ;;
+    esac
+}
+
+certificate_destination_preview() {
+    local parent=$1 domain=$2
+    validate_proxy_domain "$domain" >/dev/null || return 1
+    parent=$(certificate_normalize_destination_input "$parent") || return 1
+    parent=$(certificate_absolute_path "$parent") || return 1
+    domain=${domain,,}; domain=${domain%.}
+    printf '\n你选择的是父目录：%s\n' "$parent"
+    printf '脚本会自动追加域名目录，最终文件是：\n  %s/%s/fullchain.pem\n  %s/%s/privkey.pem\n' "$parent" "$domain" "$parent" "$domain"
+    if [ "${parent##*/}" = "$domain" ]; then
+        printf '注意：父目录末尾已经是域名，以上路径会重复一层。通常应填它的上一级目录：%s\n' "${parent%/*}"
+    else printf '请填写父目录即可，不需要再手动添加域名。\n'; fi
+}
+
+certificate_ui_human_date() { date -d "@$1" '+%Y-%m-%d %H:%M %Z'; }
+
+certificate_ui_export_result() {
+    local dest=$1 domain=$2 current=${3:-} pair
+    if [ ! -e "$dest/$domain/fullchain.pem" ] && [ ! -e "$dest/$domain/privkey.pem" ]; then
+        printf '尚未复制；签发完成后由后台任务复制。'; return 0
+    fi
+    if ! pair=$(certificate_pair_valid "$dest/$domain/fullchain.pem" "$dest/$domain/privkey.pem" "$domain" 2>&1); then
+        printf '已有副本未通过校验，旧文件保留；请查看详细信息。'; return 1
+    fi
+    if [ -n "$current" ] && { ! cmp -s -- "$current" "$dest/$domain/fullchain.pem" || ! cmp -s -- "${current%.crt}.key" "$dest/$domain/privkey.pem"; }; then
+        printf '已有副本；Caddy 已有更新版本，等待下一次同步。'
+    else printf '已复制，证书与私钥配对有效。'; fi
+}
+
+certificate_ui_domain_status() {
+    local root=$1 domain=$2 registered=$3 dest=$4 cert='' code times expires starts now days issuer
+    printf '\n域名：%s\n' "$domain"
+    cert=$(certificate_select_pair "$root" "$domain"); code=$?
+    if [ "$code" = 0 ]; then
+        times=$(certificate_pair_valid "$cert" "${cert%.crt}.key" "$domain") || return 1
+        read -r expires starts <<< "$times"
+        now=$(date +%s); days=$(((expires-now)/86400))
+        printf '  证书已签发，当前有效，证书与私钥匹配。\n'
+        printf '  生效时间：%s\n  到期时间：%s（剩余 %s 天）\n' "$(certificate_ui_human_date "$starts")" "$(certificate_ui_human_date "$expires")" "$days"
+        issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt multiline 2>/dev/null | awk -F'= *' '/organizationName/{print $2; exit}')
+        [ -n "$issuer" ] || issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt multiline 2>/dev/null | awk -F'= *' '/commonName/{print $2; exit}')
+        printf '  签发机构：%s（这里只核对文件和配对，未验证公网信任链）\n' "${issuer:-无法读取}"
+    elif [ "$code" = 2 ]; then
+        local found
+        found=$(certificate_candidates "$root" "$domain" | tr '\0' '\n') || return 1
+        if [ -n "$found" ]; then
+            printf '  已发现证书文件，但已过期、尚未生效或配对异常；请查看技术详情，原副本不会被覆盖。\n'
+        elif [[ "$(certificate_automation_read "$domain")" = 'off 0 fixed' ]]; then
+            printf '  固定证书已到期或不可读取；自动续签保持关闭，请在到期前手动处理。\n'
+        else printf '  正在等待签发，目前还没有发现可用证书（待签发/未发现）。\n'; fi
+    else return 1; fi
+    certificate_automation_describe "$domain" || return 1
+    if [ "$registered" = yes ]; then
+        printf '  自动复制：已登记。\n'
+        if [ -n "$dest" ]; then
+            printf '  复制结果：'; certificate_ui_export_result "$dest" "$domain" "$cert"; printf '\n'
+            printf '  证书文件：%s/%s/fullchain.pem\n  私钥文件：%s/%s/privkey.pem\n' "$dest" "$domain" "$dest" "$domain"
+        else printf '  复制位置尚未设置，请先选择父目录。\n'; fi
+    else printf '  自动复制：未登记；证书仍保留在 Caddy 自己的证书目录里。\n'; fi
+}
+
+certificate_watch_domain() {
+    local domain=$1 root domains dest='' registered=no answer code cert elapsed began=0
+    # Scripts and workers must never consume extra input or do interactive writes.
+    ui_interactive || return 0
+    validate_proxy_domain "$domain" >/dev/null || return 1
+    root=$(certificate_storage_root) || return 1
+    domains=$(certificate_read_domains) || return 1
+    if printf '%s\n' "$domains" | grep -Fxq -- "$domain"; then
+        registered=yes; dest=$(certificate_read_directory) || return 1
+    fi
+    printf '\n现在可以留在这里等待证书，不需要猜测什么时候申请完成。\n'
+    certificate_ui_domain_status "$root" "$domain" "$registered" "$dest" || return 1
+    cert=$(certificate_select_pair "$root" "$domain"); code=$?
+    if [ "$code" = 0 ]; then
+        certificate_automation_run || printf '续签策略尚未完全应用，请查看证书管理中的提示。\n'
+        [ "$registered" != yes ] || sync_certificates "$domain"
+        printf '\n证书已经准备好，可以返回菜单。\n'; return 0
+    fi
+    printf '\n回车：留在此页自动刷新；r：返回菜单，Caddy 和后台任务继续申请/检查。\n请选择 > '
+    IFS= read -r answer || return 0
+    [ -z "$answer" ] || return 0
+    began=$SECONDS
+    while true; do
+        cert=$(certificate_select_pair "$root" "$domain"); code=$?
+        if [ "$code" = 0 ]; then
+            printf '\n证书已经签发完成！\n'
+            certificate_automation_run || printf '续签设置尚待后台重试，请查看详细信息。\n'
+            if [ "$registered" = yes ]; then
+                if sync_certificates "$domain"; then printf '复制检查已完成，下面显示最终文件状态。\n'
+                else printf '证书已签发，但复制没有成功；原有文件保留，可在菜单重试同步。\n'; fi
+            fi
+            certificate_ui_domain_status "$root" "$domain" "$registered" "$dest"
+            return 0
+        fi
+        [ "$code" = 2 ] || return 1
+        elapsed=$((SECONDS-began))
+        printf '已等待 %s 秒，还在等待可用证书。输入 r 并回车可返回菜单。\n' "$elapsed"
+        if [ "$elapsed" -ge 120 ]; then
+            printf '已等候两分钟。回车继续等待，输入其他内容返回菜单：'
+            IFS= read -r answer || return 0
+            [ -z "$answer" ] || return 0
+            began=$SECONDS
+        fi
+        if IFS= read -r -t 3 answer; then
+            case "${answer,,}" in r|0|q) printf '已返回；Caddy 与后台任务会继续处理。\n'; return 0 ;; esac
+        else
+            code=$?
+            [ "$code" -gt 128 ] || return 0
+        fi
+    done
+}
+
+certificate_main_summary() {
+    local domains domain dest='' summary total=0 ready=0
+    domains=$(certificate_read_domains 2>/dev/null) || { printf '  证书状态暂时无法读取，请进入 12 查看原因。\n'; return 0; }
+    [ -n "$domains" ] || return 0
+    dest=$(certificate_read_directory 2>/dev/null) || { printf '  已登记证书复制，但父目录不可读，请进入 12 处理。\n'; return 0; }
+    while IFS= read -r domain; do
+        total=$((total+1))
+        if certificate_pair_valid "$dest/$domain/fullchain.pem" "$dest/$domain/privkey.pem" "$domain" >/dev/null 2>&1; then
+            ready=$((ready+1)); printf '  %s：证书已复制，可使用。\n' "$domain"
+        else printf '  %s：尚未复制可用证书，请进入 12 查看签发进度。\n' "$domain"; fi
+    done <<< "$domains"
+    printf '  证书副本：%s/%s 已准备好；详情在 12 证书管理。\n' "$ready" "$total"
+}
+
+certificate_set_directory_menu() {
+    local path domains domain duplicate=no answer
+    certificate_overview state || return 1
+    printf '这里填写父目录；脚本会在下方自动创建每个域名的子目录。\n'
+    ui_ask '请输入证书父目录（绝对路径或 ~/；空输入取消）：'
+    IFS= read -r path || return 0
+    [ -n "$path" ] || { printf '已取消。\n'; return 0; }
+    path=$(certificate_normalize_destination_input "$path") || return 1
+    path=$(certificate_validate_destination "$path") || return 1
+    domains=$(certificate_read_domains) || return 1
+    if [ -z "$domains" ]; then certificate_destination_preview "$path" example.com || return 1
+    else
+        while IFS= read -r domain; do
+            certificate_destination_preview "$path" "$domain" || return 1
+            [ "${path##*/}" != "$domain" ] || duplicate=yes
+        done <<< "$domains"
+    fi
+    if [ "$duplicate" = yes ]; then
+        printf '以上路径会重复域名。仍按这个父目录保存？[y/yes，默认 n]：\n'
+        IFS= read -r answer || return 1
+        case "${answer,,}" in y|yes) ;; *) printf '已取消，请选择上一级父目录。\n'; return 0 ;; esac
+    fi
+    set_certificate_export_directory "$path"
+}
+
+# Root already has privileges. Avoid repeated sudo hostname-resolution noise in
+# this script process only; sourcing must not replace the caller's sudo command.
+if [ "$EUID" = 0 ] && [ "${EASY_CADDY_TEST_MODE:-0}" != 1 ] && [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+    sudo() { command "$@"; }
+fi
+
 # Source callers load functions without reading stdin or entering any menu.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 if [ "$#" -gt 0 ]; then
@@ -2212,6 +2788,11 @@ if [ "$#" -gt 0 ]; then
             [ "$#" -le 2 ] || { certificate_error '用法：--sync-certificates [DOMAIN]'; exit 2; }
             sync_certificates "${2:-}"
             exit $? ;;
+        --certificate-maintenance)
+            [ "$#" = 1 ] || { certificate_error '用法：--certificate-maintenance'; exit 2; }
+            certificate_automation_run; maintenance_result=$?
+            sync_certificates || maintenance_result=1
+            exit "$maintenance_result" ;;
         *) certificate_error "未知参数：$1"; exit 2 ;;
     esac
 fi

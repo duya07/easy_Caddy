@@ -220,13 +220,13 @@ def cascade_refused():
 
 def certificate_context():
     c=Fixture('certificate-context',populated=True)
-    for option,prompt in [(2,'请输入绝对目的目录'),(4,'请选择域名'),(5,'请选择域名'),(6,'请选择域名')]:
+    for option,prompt in [(2,'请输入证书父目录'),(4,'请选择域名'),(5,'请选择域名'),(6,'请选择域名')]:
         p=c.main('12\n'+str(option)+'\n')
         assert p.returncode==0
         assert str(c.dest) in p.stdout and 'alpha.test' in p.stdout
         assert p.stdout.index('当前目的目录')<p.stdout.index(prompt)
     p=c.main('12\n1\n0\n0\n')
-    assert '有效且key匹配' in p.stdout and 'alpha.test' in p.stdout
+    assert '当前有效' in p.stdout and '证书与私钥匹配' in p.stdout and 'alpha.test' in p.stdout
     p=c.main('12\n3\n0\n0\n')
     assert '已有证书' in p.stdout and (c.dest/'alpha.test/fullchain.pem').exists()
     p=c.main('12\n6\n1\n0\n0\n')
@@ -295,7 +295,7 @@ def tty_pages():
     proc=subprocess.Popen(['/usr/bin/bash',str(script)],stdin=slave,stdout=slave,stderr=slave,env=c.env,start_new_session=True)
     os.close(slave);chunks=[];buffer=b''
     steps=[('请输入选项: ',b'4\n'),('按回车返回菜单',b'\n'),('请输入选项: ',b'3\n'),('请输入选项 > ',b'0\n'),
-           ('请输入选项: ',b'12\n'),('请选择 > ',b'2\n'),('请输入绝对目的目录',b'\n'),('按回车返回菜单',b'\n'),
+           ('请输入选项: ',b'12\n'),('请选择 > ',b'2\n'),('请输入证书父目录',b'\n'),('按回车返回菜单',b'\n'),
            ('请选择 > ',b'0\n'),('请输入选项: ',b'0\n')]
     deadline=time.monotonic()+20
     try:

@@ -112,3 +112,31 @@ python3 tests/operations.py --script /tmp/PRIVATE/easyCaddy.sh --evidence-dir /t
 ```
 
 覆盖主菜单新编号、交互清屏与结果暂停、非交互/source；新增安装归属、重复执行、部分失败、取消、默认/全部范围和连带移除拒绝；证书已有信息/空状态先于输入；统一日志与空提示；daily/weekly/monthly 的真实大小和时间轮转、归档压缩、配置启用失败恢复及不安全日志路径拒绝。不会实际安装/卸载测试主机的系统包或更改生产服务。原证书套件仅随主菜单要求把派发 8/9 更新为 12/13、编号存在性更新为 1–13，其他断言保持；旧 Caddy 回归不变。
+
+## 证书申请、续签设置与自然语言体验
+
+`certificate_experience.py` 是新增的独立 Linux 验收入口，需要 root（仅操作独占 `/tmp` 夹具）、Bash、Python 3、OpenSSL、jq、flock 和支持 `renewal_window_ratio` Caddyfile 子指令的 Caddy；本轮真实验证使用 Caddy 2.11.7。2.10.2 对该子指令的明确拒绝另行记录，不把缺少能力当作测试通过。
+
+```bash
+python3 tests/certificate_experience.py \
+  --script /tmp/PRIVATE/easyCaddy.sh \
+  --caddy-bin /usr/bin/caddy \
+  --evidence-dir /tmp/PRIVATE/certificate-experience
+```
+
+覆盖父目录与两份完整文件路径、重复域名提醒、安全的 `~/` 展开、非 TTY 不等待、按实际有效期换算天数、开启/关闭/重新开启续签、单独申请、首次签发后的窗口更新、重复后台检查不制造备份、关闭后原存储清理仍不重开申请、保留手工 TLS/共享/通配站点、加载失败回退、续签记录保存失败保持或恢复配置、成功解析不刷 warning、错误仍可见、自然语言状态，以及真实 PTY 等待返回/EOF。
+
+Caddy adapt/validate、OpenSSL、文件权限和路径检查使用真实工具；systemctl/journalctl 使用测试目录中的包装器，安装后台任务只验证配置与启用调用，不修改系统 Caddy。每例保留命令、退出状态和输出；`summary.json` 绑定被测脚本 SHA256。
+
+另有真实进程整合：
+
+```bash
+python3 tests/certificate_experience_native.py \
+  --script /tmp/PRIVATE/easyCaddy.sh \
+  --caddy-bin /usr/bin/caddy \
+  --evidence-dir /tmp/PRIVATE/certificate-experience-native
+```
+
+该入口在独占目录启动私有 Caddy（loopback 随机高端口、内部 CA、跳过系统信任安装），先打开真实 PTY 等待，再启动签发；检查首次签发、自动复制文件与私钥权限、实际运行配置中的续签比例、TLS/SNI/HTTP 响应，以及关闭固定加载/重新开启的真实 reload。进程在 finally 中停止，保留终端原始输出和结果；系统 timer 启用仍模拟，不连接公共 CA，不冒称已验证自然到期后的公共 ACME 续签。
+
+本次默认列表改为自然语言，原 141 例中的全部内部元数据断言由默认列表与显式 `certificate_technical_details` 共同核对；issuer 字典序选择仍核对实际导出 pair 和同步日志中的选择路径。原断言未删除。管理套件只更新父目录提示与自然语言匹配，保留页面切换、结果停留和退出断言；`regression.py` 保持原字节。

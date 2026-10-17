@@ -658,7 +658,9 @@ def listing(c):
     authority.write_text('AUTHORITY_PRIVATE_SENTINEL')
     before = record_tree(c.root / 'storage')
     result = c.invoke('list_certificates')
-    output = c.operation_output(result) + result.stderr
+    details = c.invoke('certificate_technical_details')
+    c.require(details.returncode == 0, 'explicit technical listing failed')
+    output = c.operation_output(result) + result.stderr + c.operation_output(details) + details.stderr
     c.require(result.returncode == 0, 'listing failed with valid/missing/expired certificate fixtures')
     for token in [DOMAIN, OTHER, 'acme.alpha', 'acme.expired', str(sources[0][0]), str(sources[0][1])]:
         c.require(token in output, 'listing lacks required public metadata: ' + token)
@@ -791,7 +793,7 @@ def selection(c, kind):
     c.assert_pair(expected)
     # Equal bytes still require a stable documented selection path in diagnostic.
     if kind == 'lexical':
-        output = c.operation_output(result) + result.stderr
+        output = c.operation_output(result) + result.stderr + (c.state / 'sync.log').read_text()
         c.require('acme.a-first' in output or str(expected[0]) in output, 'tie must identify deterministic lexical issuer')
 
 
