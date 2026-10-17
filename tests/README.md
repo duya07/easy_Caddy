@@ -140,3 +140,15 @@ python3 tests/certificate_experience_native.py \
 该入口在独占目录启动私有 Caddy（loopback 随机高端口、内部 CA、跳过系统信任安装），先打开真实 PTY 等待，再启动签发；检查首次签发、自动复制文件与私钥权限、实际运行配置中的续签比例、TLS/SNI/HTTP 响应，以及关闭固定加载/重新开启的真实 reload。进程在 finally 中停止，保留终端原始输出和结果；系统 timer 启用仍模拟，不连接公共 CA，不冒称已验证自然到期后的公共 ACME 续签。
 
 本次默认列表改为自然语言，原 141 例中的全部内部元数据断言由默认列表与显式 `certificate_technical_details` 共同核对；issuer 字典序选择仍核对实际导出 pair 和同步日志中的选择路径。原断言未删除。管理套件只更新父目录提示与自然语言匹配，保留页面切换、结果停留和退出断言；`regression.py` 保持原字节。
+
+## 脚本版本与更新验收
+
+```bash
+python3 tests/script_update.py \
+  --script /tmp/PRIVATE/easyCaddy.sh \
+  --evidence-dir /tmp/PRIVATE/script-update-tests
+```
+
+Linux/root 隔离目录中运行，使用真实 Bash、文件权限、备份和原子改名；curl 由受控下载包装器提供正常/异常候选。覆盖版本 CLI、仅检查、成功更新与权限保留、同版/旧版不覆盖、错误页面、语法损坏、身份不符、下载失败、取消/EOF、候选不执行、并发改动保护、符号链接拒绝、替换失败保留原件与备份、主菜单不自动联网，以及更新成功终止旧会话。systemctl/包管理等无关命令被拦截，脚本更新不得调用它们；主菜单只允许读取服务是否运行。
+
+原证书/反代/管理测试文件保持原字节；版本号与菜单14是新增入口，原编号保持。测试报告绑定本轮实际脚本SHA，不用之前版本的PASS冒充本轮结果。

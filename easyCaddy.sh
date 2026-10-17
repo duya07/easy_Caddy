@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# EASY_CADDY_SCRIPT_ID=duya07/easy_Caddy
+SCRIPT_VERSION='1.0.0'
+SCRIPT_UPDATE_SOURCE_URL='https://raw.githubusercontent.com/duya07/easy_Caddy/refs/heads/main/easyCaddy.sh'
+
 # caddy_proxy_tool.sh
 # 功能：
 #   1) 自动安装/卸载 Caddy
@@ -988,6 +992,7 @@ function show_menu() {
     if [ "$caddy_status" = active ]; then state_sgr='1;32'; state_text='运行中'
     else state_sgr='1;31'; state_text='未运行'; fi
     ui_page 'Caddy 一键部署与管理'
+    printf '  脚本版本：%s\n' "$SCRIPT_VERSION"
     printf '  Caddy 状态：'; ui_say "$state_sgr" "$state_text"
     certificate_main_summary
     printf '\n'
@@ -1009,6 +1014,7 @@ function show_menu() {
     ui_item 11 '依赖卸载' '（默认仅新增）' '1;31'
     ui_item 12 '证书管理' '（查看/同步/日志）'
     ui_item 13 '手动编辑配置' '（先校验再应用）'
+    ui_item 14 '检查/更新脚本' '（保留配置与证书）'
     printf '\n'
     ui_item 0 '退出'
     ui_rule '2' '-'
@@ -2780,10 +2786,139 @@ if [ "$EUID" = 0 ] && [ "${EASY_CADDY_TEST_MODE:-0}" != 1 ] && [[ "${BASH_SOURCE
     sudo() { command "$@"; }
 fi
 
+# Script updates are explicit operations, independent of Caddy/configuration.
+script_version_valid() {
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})$ ]]
+}
+
+script_version_from_file() {
+    local file=$1 line version='' count=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^SCRIPT_VERSION=\'([0-9]+\.[0-9]+\.[0-9]+)\'$ ]]; then
+            version=${BASH_REMATCH[1]}; count=$((count+1))
+        fi
+    done < "$file"
+    [ "$count" = 1 ] && script_version_valid "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+script_version_compare() {
+    script_version_valid "$1" && script_version_valid "$2" || return 1
+    local index left right
+    local -a current candidate
+    IFS=. read -r -a current <<< "$1"
+    IFS=. read -r -a candidate <<< "$2"
+    for index in 0 1 2; do
+        left=$((10#${current[index]})); right=$((10#${candidate[index]}))
+        if [ "$left" -lt "$right" ]; then printf '%s\n' -1; return 0; fi
+        if [ "$left" -gt "$right" ]; then printf '%s\n' 1; return 0; fi
+    done
+    printf '0\n'
+}
+
+# Return 10 only after replacement: the caller must finish the old process.
+script_update() (
+    umask 077
+    local action=${1:-check} target directory work stage='' backup='' lock lock_fd
+    local original_identity original_hash current_identity remote_version comparison answer tool
+    case "$action" in check|apply) ;; *) certificate_error '更新操作无效。'; return 2 ;; esac
+    for tool in curl bash realpath stat sha256sum mktemp grep head wc cp mv chmod chown flock; do
+        command -v "$tool" >/dev/null 2>&1 || { certificate_error "缺少 $tool，暂时无法检查或更新；请先在依赖菜单处理。"; return 1; }
+    done
+    target=$(certificate_absolute_path "$(realpath -ms -- "${BASH_SOURCE[0]}")") || return 1
+    certificate_safe_file "$target" || { certificate_error '当前脚本不是独立普通文件，请先下载到本地再更新。'; return 1; }
+    directory=$(dirname -- "$target")
+    original_identity=$(stat -c '%d:%i:%u:%g:%a:%s:%y:%z' -- "$target") || return 1
+    original_hash=$(sha256sum -- "$target") || return 1
+    [ "$(script_version_from_file "$target")" = "$SCRIPT_VERSION" ] || {
+        certificate_error '磁盘脚本与当前加载版本不同，请重新运行脚本后再检查更新。'; return 1;
+    }
+    printf '当前脚本版本：%s\n更新来源：duya07/easy_Caddy 的 main 分支。\n' "$SCRIPT_VERSION"
+    work=$(mktemp -d) || return 1
+    trap 'rm -rf -- "$work"; [ -z "$stage" ] || rm -f -- "$stage"' EXIT
+    if ! curl --fail --silent --show-error --location --max-redirs 3 \
+        --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 45 --retry 1 \
+        --max-filesize 2097152 --output "$work/candidate.sh" "$SCRIPT_UPDATE_SOURCE_URL" 2> "$work/download.log"; then
+        certificate_error '暂时无法下载新版脚本，可能是网络或下载源不可用；当前脚本保持不变。'
+        return 1
+    fi
+    if [ ! -s "$work/candidate.sh" ] || [ "$(wc -c < "$work/candidate.sh")" -gt 2097152 ] ||
+        [ "$(head -n 1 -- "$work/candidate.sh")" != '#!/usr/bin/env bash' ] ||
+        ! grep -Fxq '# EASY_CADDY_SCRIPT_ID=duya07/easy_Caddy' "$work/candidate.sh"; then
+        certificate_error '下载结果不是可识别的 easy_Caddy 脚本，当前文件保持不变。'; return 1
+    fi
+    remote_version=$(script_version_from_file "$work/candidate.sh") || {
+        certificate_error '下载的脚本没有唯一、有效的版本号，可能是旧版或异常页面；当前文件保持不变。'; return 1;
+    }
+    if ! env -u BASH_ENV -u ENV bash --noprofile --norc -n "$work/candidate.sh" 2> "$work/syntax.log"; then
+        certificate_error '下载的脚本没有通过 Bash 语法检查，当前文件保持不变。'; return 1
+    fi
+    comparison=$(script_version_compare "$SCRIPT_VERSION" "$remote_version") || return 1
+    printf '线上脚本版本：%s\n' "$remote_version"
+    case "$comparison" in
+        0) printf '你已经在使用当前版本，无需更新。\n'; return 0 ;;
+        1) printf '本地版本比线上版本更新，本次不降级。\n'; return 0 ;;
+    esac
+    if [ "$action" = check ]; then
+        printf '有新版本可用。可在主菜单 14 更新，或运行：bash ./easyCaddy.sh --update\n'
+        return 0
+    fi
+    [ "$(stat -c %u -- "$target")" = "$EUID" ] && [ -w "$directory" ] || {
+        certificate_error '没有权限替换此脚本，请使用脚本所属用户执行（root 文件请用 sudo）。'; return 1;
+    }
+    if [ "$EUID" = 0 ]; then certificate_controlled_path "$directory" || return 1; fi
+    printf '\n将把 %s 更新为 %s。\n' "$SCRIPT_VERSION" "$remote_version"
+    printf '会先备份当前脚本；你的反代配置、证书、目录登记和运行中的服务不会被修改。\n'
+    printf '更新成功后本次会话将结束，请重新运行脚本。确认更新？[y/yes，默认 n]：\n'
+    IFS= read -r answer || { printf '输入结束，已取消更新。\n'; return 0; }
+    case "${answer,,}" in y|yes) ;; *) printf '已取消更新，当前脚本保持不变。\n'; return 0 ;; esac
+    lock=$target.update.lock
+    if [ ! -e "$lock" ] && [ ! -L "$lock" ]; then (set -o noclobber; : > "$lock") 2>/dev/null || :; fi
+    certificate_safe_file "$lock" && [ "$(stat -c %u -- "$lock")" = "$EUID" ] || {
+        certificate_error '更新锁不可安全使用，当前脚本保持不变。'; return 1;
+    }
+    exec {lock_fd}< "$lock" || return 1
+    flock -x -w 10 "$lock_fd" || { certificate_error '另一个更新正在进行，请稍后重试。'; return 1; }
+    certificate_safe_file "$target" || return 1
+    current_identity=$(stat -c '%d:%i:%u:%g:%a:%s:%y:%z' -- "$target") || return 1
+    if [ "$original_identity" != "$current_identity" ] || [ "$original_hash" != "$(sha256sum -- "$target")" ]; then
+        certificate_error '等待期间脚本被其他操作改动，未覆盖；请重新运行后再更新。'; return 1
+    fi
+    stage=$(mktemp "$directory/.easy-caddy-update.XXXXXX") || return 1
+    cp -- "$work/candidate.sh" "$stage" && chmod --reference="$target" -- "$stage" &&
+        chown --reference="$target" -- "$stage" || { certificate_error '新版暂存失败，当前脚本保持不变。'; return 1; }
+    backup=$(mktemp "$target.backup.$SCRIPT_VERSION.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || return 1
+    if ! cp -p -- "$target" "$backup" || ! cmp -s -- "$target" "$backup"; then
+        certificate_error "备份没有完成，未替换脚本；请检查：$backup"; return 1
+    fi
+    if ! certificate_safe_file "$target" || [ "$original_identity" != "$(stat -c '%d:%i:%u:%g:%a:%s:%y:%z' -- "$target")" ] ||
+        [ "$original_hash" != "$(sha256sum -- "$target")" ]; then
+        certificate_error "脚本又发生了变动，未覆盖；备份：$backup"; return 1
+    fi
+    if ! mv -fT -- "$stage" "$target"; then
+        certificate_error "替换失败，原脚本保留；备份：$backup"; return 1
+    fi
+    stage=''
+    printf '\n更新成功：%s → %s。\n备份：%s\n请重新运行：bash "%s"\n' "$SCRIPT_VERSION" "$remote_version" "$backup" "$target"
+    if [ -f "$CERT_WORKER_INSTALL_DIR/easyCaddy.sh" ]; then
+        printf '证书后台快照仍按原版运行；需要刷新时，可重新开启一次证书复制或保存续签设置。\n'
+    fi
+    return 10
+)
+
 # Source callers load functions without reading stdin or entering any menu.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 if [ "$#" -gt 0 ]; then
     case "$1" in
+        --version)
+            [ "$#" = 1 ] || { certificate_error '用法：--version'; exit 2; }
+            printf 'easy_Caddy %s\n' "$SCRIPT_VERSION"; exit 0 ;;
+        --check-update|--update)
+            [ "$#" = 1 ] || { certificate_error '用法：--check-update 或 --update'; exit 2; }
+            if [ "$1" = --check-update ]; then script_update check; update_result=$?
+            else script_update apply; update_result=$?; fi
+            [ "$update_result" != 10 ] || update_result=0
+            exit "$update_result" ;;
         --sync-certificates)
             [ "$#" -le 2 ] || { certificate_error '用法：--sync-certificates [DOMAIN]'; exit 2; }
             sync_certificates "${2:-}"
@@ -2822,6 +2957,9 @@ while true; do
         11) ui_page '依赖卸载'; dependency_uninstall_menu ;;
         12) certificate_menu; continue ;;
         13) ui_page '手动编辑 Caddy 配置'; manual_edit_caddyfile ;;
+        14) ui_page '脚本版本与更新'
+            script_update apply; update_result=$?
+            if [ "$update_result" = 10 ]; then exit 0; fi ;;
         0) printf '退出脚本。\n'; exit 0 ;;
         *) ui_page '选项提示'; ui_warn '无效选项，请重新输入。' ;;
     esac
