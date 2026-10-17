@@ -164,7 +164,7 @@ class Fixture:
 def menu():
     c=Fixture('menu');p=c.main('0\n')
     assert p.returncode==0
-    for n in range(14):assert re.search(r'(?m)^\s*'+str(n)+r'\)',p.stdout),n
+    for n in range(14):assert re.search(r'(?m)^\s*'+str(n)+r'(?:\)|[ \t])',p.stdout),n
     for label in ['依赖检测与安装','依赖卸载','日志查看','日志轮转设置','证书管理','手动编辑']:assert label in p.stdout,label
     assert '\x1b' not in p.stdout
     assert c.call('printf SOURCE_SAFE',expected=0).stdout=='SOURCE_SAFE'
@@ -294,8 +294,8 @@ def tty_pages():
     master,slave=pty.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',48,40,0,0))
     proc=subprocess.Popen(['/usr/bin/bash',str(script)],stdin=slave,stdout=slave,stderr=slave,env=c.env,start_new_session=True)
     os.close(slave);chunks=[];buffer=b''
-    steps=[('请输入选项: ',b'4\n'),('按回车返回菜单',b'\n'),('请输入选项: ',b'3\n'),('请输入选项 > ',b'0\n'),
-           ('请输入选项: ',b'12\n'),('请选择 > ',b'2\n'),('请输入证书父目录',b'\n'),('按回车返回菜单',b'\n'),
+    steps=[('请输入选项: ',b'4\n'),('按回车返回',b'\n'),('请输入选项: ',b'3\n'),('请输入选项 > ',b'0\n'),
+           ('请输入选项: ',b'12\n'),('请选择 > ',b'2\n'),('请输入证书父目录',b'\n'),('按回车返回',b'\n'),
            ('请选择 > ',b'0\n'),('请输入选项: ',b'0\n')]
     deadline=time.monotonic()+20
     try:
@@ -318,7 +318,7 @@ def tty_pages():
     raw=b''.join(chunks);(c.root/'tty.ansi').write_bytes(raw)
     text=raw.decode();(c.root/'tty.txt').write_text(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',text))
     assert text.count('\x1b[2J')>=7
-    status=text.index('CADDY_STATUS_FIXTURE');pause=text.index('按回车返回菜单',status)
+    status=text.index('CADDY_STATUS_FIXTURE');pause=text.index('按回车返回',status)
     assert '\x1b[2J' not in text[status:pause]
     assert '\x1b[2J' in text[pause:]
 

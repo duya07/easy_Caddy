@@ -623,7 +623,7 @@ def menus(c):
     result = c.invoke('show_menu')
     output = c.operation_output(result)
     for number in range(1, 14):
-        c.require(re.search(r'(?m)^\s*' + str(number) + r'[.)、）]', output) is not None, 'main menu is missing option ' + str(number))
+        c.require(re.search(r'(?m)^\s*' + str(number) + r'(?:[.)、）]|[ \t])', output) is not None, 'main menu is missing option ' + str(number))
     c.require('证书' in output and '编辑' in output, 'main menu must name certificate management and editing')
     # Both new dispatches are executed in actual script processes, bounded by EOF.
     view = c.execute(['bash', c.product], '12\n')

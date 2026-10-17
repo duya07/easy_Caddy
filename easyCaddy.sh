@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # EASY_CADDY_SCRIPT_ID=duya07/easy_Caddy
-SCRIPT_VERSION='1.0.0'
+SCRIPT_VERSION='1.0.3'
 SCRIPT_UPDATE_SOURCE_URL='https://raw.githubusercontent.com/duya07/easy_Caddy/refs/heads/main/easyCaddy.sh'
 
 # caddy_proxy_tool.sh
@@ -623,41 +623,200 @@ function show_caddy_status() {
 #--------------------------------------------
 # 查看反向代理配置，并显示上游服务状态
 #--------------------------------------------
-function show_reverse_proxies() {
-    local lineno line upstream port status
-    if [ -f "$PROXY_CONFIG_FILE" ]; then
-        echo "当前反向代理配置："
-        lineno=0
-        while IFS= read -r line || [ -n "$line" ]; do
-            # 行号与配置文件物理行号严格一致（删除功能按物理行号定位，不能跳号）
+show_reverse_proxies() (
+  local lineno line upstream port status
+  local caddy_failed=0
+  local registry_has_entry=0
+
+  echo '当前反向代理配置：'
+  echo '  [登记项（可按编号删除）]'
+
+  # ---- 登记项：保留物理行号 ----
+  if [ -L "$PROXY_CONFIG_FILE" ]; then
+    echo '    [登记文件为符号链接，已拒绝读取：'"$PROXY_CONFIG_FILE"']'
+    caddy_failed=1
+  elif [ ! -e "$PROXY_CONFIG_FILE" ]; then
+    echo '    (暂无登记项，未找到登记文件)'
+  else
+    if declare -F certificate_safe_file >/dev/null 2>&1; then
+      if ! certificate_safe_file "$PROXY_CONFIG_FILE" >/dev/null 2>&1; then
+        echo '    [登记文件不安全或不可读，已拒绝读取：'"$PROXY_CONFIG_FILE"']'
+        caddy_failed=1
+      else
+        if [ ! -r "$PROXY_CONFIG_FILE" ]; then
+          echo '    [登记文件不可读：'"$PROXY_CONFIG_FILE"']'
+          caddy_failed=1
+        elif [ ! -s "$PROXY_CONFIG_FILE" ]; then
+          echo '    (暂无登记项)'
+        else
+          lineno=0
+          while IFS= read -r line || [ -n "$line" ]; do
             lineno=$((lineno+1))
-            # 空行直接跳过：既不必显示，也不能拿空串去探测
-            if [ -z "$line" ]; then
-                continue
+            if [ -z "$(printf '%s' "$line" | tr -d ' \t\r')" ]; then
+              continue
             fi
-            # 解析格式 "域名 -> upstream"，upstream 可能是本地回环地址，也可能是远程网址
-            upstream=$(echo "$line" | awk -F' -> ' '{print $2}')
+            registry_has_entry=1
+            upstream=$(printf '%s' "$line" | awk -F' -> ' '{print $2}')
             if [ -z "$upstream" ]; then
-                echo "${lineno}) ${line} [配置行格式不正确]"
-                continue
+              echo "    ${lineno}) ${line} [配置行格式不正确]"
+              continue
             fi
             if upstream_is_loopback "$upstream"; then
-                port=$(loopback_port "$upstream")
-                if [ -z "$port" ]; then
-                    echo "${lineno}) ${line} [本地端口未知（上游地址解析不出端口），未探测]"
-                else
-                    status=$(check_port_running "$port")
-                    echo "${lineno}) ${line} [本地端口 ${port}，上游服务状态：$status]"
-                fi
+              port=$(loopback_port "$upstream")
+              if [ -z "$port" ]; then
+                echo "    ${lineno}) ${line} [本地端口未知，未探测]"
+              else
+                status=$(check_port_running "$port")
+                echo "    ${lineno}) ${line} [本地端口 ${port}，上游服务状态：$status]"
+              fi
             else
-                status=$(check_remote_upstream "$upstream")
-                echo "${lineno}) ${line} [远程网址，可达性：$status]"
+              status=$(check_remote_upstream "$upstream")
+              echo "    ${lineno}) ${line} [远程网址，可达性：$status]"
             fi
-        done < "$PROXY_CONFIG_FILE"
+          done < "$PROXY_CONFIG_FILE"
+          if [ "$registry_has_entry" = "0" ]; then
+            echo '    (暂无有效登记项，文件仅含空行)'
+          fi
+        fi
+      fi
     else
-        echo "没有配置任何反向代理。"
+      if [ ! -r "$PROXY_CONFIG_FILE" ]; then
+        echo '    [登记文件不可读：'"$PROXY_CONFIG_FILE"']'
+        caddy_failed=1
+      elif [ ! -s "$PROXY_CONFIG_FILE" ]; then
+        echo '    (暂无登记项)'
+      else
+        lineno=0
+        while IFS= read -r line || [ -n "$line" ]; do
+          lineno=$((lineno+1))
+          if [ -z "$(printf '%s' "$line" | tr -d ' \t\r')" ]; then
+            continue
+          fi
+          registry_has_entry=1
+          upstream=$(printf '%s' "$line" | awk -F' -> ' '{print $2}')
+          if [ -z "$upstream" ]; then
+            echo "    ${lineno}) ${line} [配置行格式不正确]"
+            continue
+          fi
+          if upstream_is_loopback "$upstream"; then
+            port=$(loopback_port "$upstream")
+            if [ -z "$port" ]; then
+              echo "    ${lineno}) ${line} [本地端口未知，未探测]"
+            else
+              status=$(check_port_running "$port")
+              echo "    ${lineno}) ${line} [本地端口 ${port}，上游服务状态：$status]"
+            fi
+          else
+            status=$(check_remote_upstream "$upstream")
+            echo "    ${lineno}) ${line} [远程网址，可达性：$status]"
+          fi
+        done < "$PROXY_CONFIG_FILE"
+        if [ "$registry_has_entry" = "0" ]; then
+          echo '    (暂无有效登记项，文件仅含空行)'
+        fi
+      fi
     fi
-}
+  fi
+
+  echo ''
+  echo '  [当前Caddyfile（只读，未登记项不可按编号删除）]'
+
+  if [ -z "${CADDYFILE:-}" ]; then
+    echo '    [Caddyfile 路径未设置，无法读取当前配置]'
+    caddy_failed=1
+  elif [ -L "$CADDYFILE" ]; then
+    echo '    [Caddyfile 为符号链接，已拒绝读取：'"$CADDYFILE"']'
+    caddy_failed=1
+  elif [ ! -e "$CADDYFILE" ]; then
+    echo '    Caddyfile 不存在，未配置站点。'
+  elif declare -F certificate_safe_file >/dev/null 2>&1 && ! certificate_safe_file "$CADDYFILE" >/dev/null 2>&1; then
+    echo '    [Caddyfile 不安全或不可读，已拒绝读取：'"$CADDYFILE"']'
+    caddy_failed=1
+  elif [ ! -r "$CADDYFILE" ]; then
+    echo '    [Caddyfile 不可读：'"$CADDYFILE"']'
+    caddy_failed=1
+  elif [ ! -s "$CADDYFILE" ]; then
+    echo '    Caddyfile 为空，没有站点。'
+  else
+    if ! command -v caddy >/dev/null 2>&1; then
+      echo '    [缺少依赖：caddy，未能解析 Caddyfile]'
+      caddy_failed=1
+    elif ! command -v jq >/dev/null 2>&1; then
+      echo '    [缺少依赖：jq，未能解析 Caddyfile]'
+      caddy_failed=1
+    else
+      local tmp_json="" tmp_err="" jq_err="" records rc
+      tmp_json=$(mktemp 2>/dev/null) || tmp_json=""
+      tmp_err=$(mktemp 2>/dev/null) || tmp_err=""
+      jq_err=$(mktemp 2>/dev/null) || jq_err=""
+      if [ -z "$tmp_json" ] || [ -z "$tmp_err" ] || [ -z "$jq_err" ]; then
+        rm -f "$tmp_json" "$tmp_err" "$jq_err"
+        echo '    [无法创建临时文件，解析失败]'
+        caddy_failed=1
+      else
+        trap 'rm -f "$tmp_json" "$tmp_err" "$jq_err"' EXIT
+        if ! proxy_view_adapt_json "$CADDYFILE" "$tmp_json" "$tmp_err"; then
+          echo '    [Caddyfile 解析失败，当前配置展示不完整]'
+          if [ -s "$tmp_err" ]; then
+            sed 's/^/    /' "$tmp_err"
+          fi
+          caddy_failed=1
+        else
+          if [ ! -s "$tmp_json" ]; then
+            echo '    [caddy adapt 未输出 JSON，解析失败]'
+            caddy_failed=1
+          else
+            local jq_prog
+            jq_prog='
+def host_list: ([.match[]? | .host[]? ] | select(.!=null));
+def path_list: ([.match[]? | .path[]? ] | select(.!=null));
+def walk(inherited_hosts; inherited_paths):
+  . as $r
+  | (host_list // []) as $h
+  | (path_list // []) as $p
+  | (if ($h|length)>0 then $h else inherited_hosts end) as $cur_hosts
+  | (if ($p|length)>0 then (inherited_paths + $p) else inherited_paths end) as $cur_paths
+  | (
+      ($r.handle[]? | select(.handler=="reverse_proxy") | {hosts:$cur_hosts, paths:$cur_paths, upstreams:(.upstreams//[]), transport:(.transport//null), dynamic: (has("dynamic_upstreams") or has("dynamicUpstreams") or (((.upstreams//[])|length)==0))}),
+      ($r.handle[]? | select(.handler=="subroute") | .routes[]? | walk($cur_hosts; $cur_paths))
+    )
+;
+.apps.http.servers[]?.routes[]? | walk([]; [])
+'
+            records=$(jq -c "$jq_prog" "$tmp_json" 2>"$jq_err")
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo '    [Caddyfile JSON 解析失败]'
+              if [ -s "$jq_err" ]; then sed 's/^/    /' "$jq_err"; fi
+              caddy_failed=1
+            else
+              if [ -z "$records" ]; then
+                echo '    (当前 Caddyfile 未发现 reverse_proxy 配置)'
+              else
+                local obj
+                while IFS= read -r obj; do
+                  [ -n "$obj" ] || continue
+                  proxy_view_format_one "$obj"
+                done <<EOF
+$records
+EOF
+              fi
+            fi
+          fi
+        fi
+        rm -f "$tmp_json" "$tmp_err" "$jq_err"
+        trap - EXIT 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  if [ "$caddy_failed" != "0" ]; then
+    echo ''
+    echo '[注意：Caddyfile/登记文件解析不完整，以上展示可能不全]'
+    return 1
+  fi
+  return 0
+)
 
 #--------------------------------------------
 # 从当前 Caddyfile 中按块删除指定域名的 site 块
@@ -775,78 +934,168 @@ function remove_caddy() {
 # 终端菜单视觉层：只定义函数，不在顶层执行。
 # 颜色仅在 stdout 为真实 TTY、NO_COLOR 未设置（含空值）且 TERM 非 dumb 时启用；
 # 其余情况输出纯文本（无 ANSI）。版面按 40 列终端设计，不依赖特殊字体。
+# 紧凑策略：标题单线+单分隔线，分组单行无装饰，选项默认多色，描述与提示紧凑。
+# 调色策略：标题 1;35 / 分组 1;36 / 编号 1;36 / 标签 97 / 说明 90 / 危险 31 / 成功 32 / 警告 33 / 域名 96 / 路径 33 / 值 93-97
 
 # 当前 stdout 是否启用 ANSI 颜色
 ui_color_enabled() {
-    [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != "dumb" ]
+     [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != "dumb" ]
 }
 
 # ui_paint <sgr> <text>：不换行输出；颜色关闭或 sgr 为空时输出纯文本
 ui_paint() {
-    if [ -n "$1" ] && ui_color_enabled; then
-        printf '\033[%sm%s\033[0m' "$1" "$2"
-    else
-        printf '%s' "$2"
-    fi
+     if [ -n "$1" ] && ui_color_enabled; then
+         printf '\033[%sm%s\033[0m' "$1" "$2"
+     else
+         printf '%s' "$2"
+     fi
 }
 
 # ui_say <sgr> <text>：带换行输出
 ui_say() {
-    ui_paint "$1" "$2"
-    printf '\n'
+     ui_paint "$1" "$2"
+     printf '\n'
 }
 
 # ui_rule <sgr> <char>：36 列分隔线（ASCII，宽度固定，CJK 宽字符环境也不换行）
 ui_rule() {
-    local i line=''
-    for ((i = 0; i < 36; i++)); do
-        line+="$2"
-    done
-    ui_say "$1" "$line"
+     local i line=''
+     for ((i = 0; i < 36; i++)); do
+         line+="$2"
+     done
+     ui_say "$1" "$line"
 }
 
-# ui_header <标题>：顶部标题块（上下双线 + 空行）
+# ui_header <标题>：紧凑标题块（标题行 + 单分隔线，不再双框）
 ui_header() {
-    ui_rule '36' '='
-    ui_say '1;36' "  $1"
-    ui_rule '36' '='
-    printf '\n'
+   local title="${1:-}"
+   if ui_color_enabled; then
+     printf "\n"
+     ui_paint "1;35" "  ◆ ${title}"
+     printf "\n"
+     ui_rule "90" "─"
+   else
+     printf "\n"
+     printf "  %s\n" "$title"
+     printf -- '--------------------------------\n'
+   fi
 }
 
-# ui_group <分组名>：分组标题
+# ui_group <分组名>：紧凑分组标题（单行，无第二装饰行）
 ui_group() {
-    printf '  '
-    ui_say '1' "$1"
+   local title="${1:-}"
+   if ui_color_enabled; then
+     ui_paint "1;36" "▸ ${title}"
+     printf "\n"
+   else
+     printf "▸ %s\n" "$title"
+   fi
 }
 
-# ui_item <编号> <标签> [说明] [标签 SGR]：选项行，形如 "    N) 标签"
+# ui_item <编号> <标签> [说明] [标签 SGR] [说明 SGR]：选项行，形如 "  N) 标签  说明"
+# 编号 1;36，标签默认 97，说明默认 90；危险/特殊项可传入覆盖 SGR。
 ui_item() {
-    printf '    '
-    ui_paint '36' "$1)"
-    printf ' '
-    ui_paint "${4:-}" "$2"
-    if [ -n "${3:-}" ]; then
-        printf '  '
-        ui_paint '2' "$3"
-    fi
-    printf '\n'
+   local num="${1:-}" label="${2:-}" desc="${3:-}" lsgr="${4:-}" dsgr="${5:-}"
+   local cols indent="      "
+   cols=$(_ui_cols)
+   # 默认配色：标签亮白，说明灰
+   if [ -z "$lsgr" ]; then lsgr="97"; fi
+   if [ -z "$dsgr" ]; then dsgr="90"; fi
+   if [ -z "$desc" ]; then
+     if ui_color_enabled; then
+       ui_paint "1;36" "$(printf " %2s " "$num")"
+       ui_paint "$lsgr" "$label"
+       printf "\n"
+     else
+       printf " %2s  %s\n" "$num" "$label"
+     fi
+     return 0
+   fi
+   local w_label w_desc w_total use_two=0
+   w_label=$(_ui_width "$label")
+   w_desc=$(_ui_width "$desc")
+   w_total=$((4 + w_label + 3 + w_desc))
+   if [ "$cols" -le 50 ]; then
+     use_two=1
+   elif [ "$w_label" -gt $((cols - 8)) ]; then
+     use_two=1
+   elif [ "$w_total" -gt $((cols - 2)) ]; then
+     use_two=1
+   elif [ "$cols" -le 80 ] && [ "$w_total" -gt 44 ]; then
+     use_two=1
+   fi
+   if [ "$use_two" -eq 1 ]; then
+     if ui_color_enabled; then
+       ui_paint "1;36" "$(printf " %2s " "$num")"
+       ui_paint "$lsgr" "$label"
+       printf "\n"
+       printf "%s" "$indent"
+       ui_paint "$dsgr" "· $desc"
+       printf "\n"
+     else
+       printf " %2s  %s\n" "$num" "$label"
+       printf "%s· %s\n" "$indent" "$desc"
+     fi
+   else
+     if ui_color_enabled; then
+       ui_paint "1;36" "$(printf " %2s " "$num")"
+       ui_paint "$lsgr" "$label"
+       printf "  "
+       ui_paint "$dsgr" "· $desc"
+       printf "\n"
+     else
+       printf " %2s  %s  · %s\n" "$num" "$label" "$desc"
+     fi
+   fi
 }
 
-# ui_sub <说明>：选项下方的暗色缩进说明行
+# ui_sub <说明>：紧凑说明行（无额外空行，灰色）
 ui_sub() {
-    printf '       '
-    ui_say '2' "$1"
+   local text="${1:-}"
+   if [ -z "$text" ]; then return 0; fi
+   if ui_color_enabled; then
+     ui_paint "90" "  ${text}"
+     printf "\n"
+   else
+     printf "  %s\n" "$text"
+   fi
 }
 
-# ui_ask <提示>：输入提示文字（不读取输入）
+# ui_ask <提示>：输入提示文字（青色箭头）
 ui_ask() {
-    ui_say '36' "$1"
+   local text="${1:-}"
+   if ui_color_enabled; then
+     ui_paint "1;36" "  → ${text}"
+     printf "\n"
+   else
+     printf "  -> %s\n" "$text"
+   fi
 }
 
-# ui_warn <信息>：错误或无效输入提示
+# ui_warn <信息>：错误或无效输入提示（黄色）
 ui_warn() {
-    ui_say '1;31' "$1"
+   local text="${1:-}"
+   if ui_color_enabled; then
+     ui_paint "1;33" "  ! ${text}"
+     printf "\n"
+   else
+     printf "  ! %s\n" "$text"
+   fi
 }
+
+# ui_field <标签> <值> [标签 SGR] [值 SGR]：紧凑键值行，用于详情展示（标签青灰，值亮色）
+ui_field() {
+   local label="${1:-}" value="${2:-}" lsgr="${3:-90}" vsgr="${4:-97}"
+   if ui_color_enabled; then
+     ui_paint "$lsgr" "  ${label}"
+     printf " "
+     ui_paint "$vsgr" "${value}"
+     printf "\n"
+   else
+     printf "  %s %s\n" "$label" "$value"
+   fi
+}
+
 
 #--------------------------------------------
 # 显示主菜单（顶部显示 Caddy 运行状态）
@@ -869,31 +1118,36 @@ ui_page() {
 }
 
 ui_pause() {
-    ui_interactive || return 0
-    local answer
-    printf '\n按回车返回菜单…'
-    IFS= read -r answer
+   if ! ui_interactive; then return 0; fi
+   if ui_color_enabled; then
+     ui_paint "90" "  按回车返回…"
+     printf "\n"
+   else
+     printf "  按回车返回…\n"
+   fi
+   read -r || return $?
+   return 0
 }
 
 certificate_context_state() {
-    local dest domains domain
-    certificate_controlled_path "$CERT_STATE_DIR" || return 1
-    if [ -e "$CERT_STATE_DIR/export-directory" ] || [ -L "$CERT_STATE_DIR/export-directory" ]; then
-        dest=$(certificate_read_directory) || return 1
-        printf '当前目的目录（父目录）：%s\n' "$dest"
-        printf '每个域名会自动追加一层子目录；这里只填写父目录。\n'
-    else
-        printf '当前目的目录：未设置\n'
-    fi
-    domains=$(certificate_read_domains) || return 1
-    printf '\n已登记域名与复制状态：\n'
-    if [ -z "$domains" ]; then printf '  无已登记域名；自动复制未登记。\n'
-    else
-        while IFS= read -r domain; do
-            printf '  %s  [已开启复制登记]\n' "$domain"
-            [ -z "${dest:-}" ] || printf '    最终文件：%s/%s/fullchain.pem\n              %s/%s/privkey.pem\n' "$dest" "$domain" "$dest" "$domain"
-        done <<< "$domains"
-    fi
+     local dest domains domain
+     certificate_controlled_path "$CERT_STATE_DIR" || return 1
+     if [ -e "$CERT_STATE_DIR/export-directory" ] || [ -L "$CERT_STATE_DIR/export-directory" ]; then
+         dest=$(certificate_read_directory) || return 1
+         if ui_color_enabled; then ui_field "目的目录:" "$dest" "90" "33"; else printf '当前目的目录（父目录）：%s\n' "$dest"; fi
+         ui_sub '每个域名自动追加一层子目录'
+     else
+         if ui_color_enabled; then ui_paint "90" "  目的目录："; ui_paint "33" "未设置"; printf "\n"; else printf '当前目的目录：未设置\n'; fi
+     fi
+     domains=$(certificate_read_domains) || return 1
+     ui_group '已登记域名'
+     if [ -z "$domains" ]; then ui_sub '无已登记域名'
+     else
+         while IFS= read -r domain; do
+             if ui_color_enabled; then printf '  '; ui_paint "96" "$domain"; printf ' '; ui_paint "32" "● 已登记"; printf '\n'; else printf '  %s  [已开启复制登记]\n' "$domain"; fi
+             [ -z "${dest:-}" ] || { if ui_color_enabled; then ui_field "  证书" "$dest/$domain/fullchain.pem" "90" "33"; ui_field "  私钥" "$dest/$domain/privkey.pem" "90" "31"; else printf '    最终文件：%s/%s/fullchain.pem\n              %s/%s/privkey.pem\n' "$dest" "$domain" "$dest" "$domain"; fi; }
+         done <<< "$domains"
+     fi
 }
 
 certificate_available_domains() {
@@ -986,107 +1240,142 @@ certificate_select_domain() {
     CERT_SELECTED_DOMAIN=$input
 }
 
-function show_menu() {
-    local state_sgr state_text
-    caddy_status=$(systemctl is-active caddy 2>/dev/null)
-    if [ "$caddy_status" = active ]; then state_sgr='1;32'; state_text='运行中'
-    else state_sgr='1;31'; state_text='未运行'; fi
-    ui_page 'Caddy 一键部署与管理'
-    printf '  脚本版本：%s\n' "$SCRIPT_VERSION"
-    printf '  Caddy 状态：'; ui_say "$state_sgr" "$state_text"
-    certificate_main_summary
-    printf '\n'
-    ui_group '部署与代理'
-    ui_item 1 '安装 Caddy' '（已装则跳过）'
-    ui_item 2 '依赖检测与安装'
-    ui_item 3 '配置反向代理'
-    printf '\n'
-    ui_group '服务运维'
-    ui_item 4 '查看服务状态'
-    ui_item 5 '查看反代配置' '（含上游状态）'
-    ui_item 6 '删除反向代理' '' '1;31'
-    ui_item 7 '重启 Caddy 服务'
-    ui_item 8 '日志查看'
-    ui_item 9 '日志轮转设置'
-    printf '\n'
-    ui_group '维护'
-    ui_item 10 '卸载 Caddy' '（删除配置）' '1;31'
-    ui_item 11 '依赖卸载' '（默认仅新增）' '1;31'
-    ui_item 12 '证书管理' '（查看/同步/日志）'
-    ui_item 13 '手动编辑配置' '（先校验再应用）'
-    ui_item 14 '检查/更新脚本' '（保留配置与证书）'
-    printf '\n'
-    ui_item 0 '退出'
-    ui_rule '2' '-'
+show_menu() {
+   local caddy_status state_sgr state_text cols
+   caddy_status=$(systemctl is-active caddy 2>/dev/null)
+   if [ "$caddy_status" = "active" ]; then
+     state_sgr="1;32"
+     state_text="运行中"
+   else
+     state_sgr="1;33"
+     state_text="未运行"
+   fi
+   ui_page 'Caddy 一键部署与管理'
+   cols=$(_ui_cols)
+   if [ "$cols" -le 50 ]; then
+     if ui_color_enabled; then
+       printf "  "
+       ui_paint "90" "脚本版本：$SCRIPT_VERSION"
+       printf "  "
+       ui_paint "$state_sgr" "● $state_text"
+       printf "\n"
+     else
+       printf "  脚本版本：%s  Caddy %s\n" "$SCRIPT_VERSION" "$state_text"
+     fi
+   else
+     if ui_color_enabled; then
+       printf "  "
+       ui_paint "90" "脚本版本：$SCRIPT_VERSION"
+       printf "  "
+       ui_paint "90" "│"
+       printf "  Caddy "
+       ui_paint "$state_sgr" "$state_text"
+       printf "\n"
+     else
+       printf "  脚本版本：%s  │  Caddy %s\n" "$SCRIPT_VERSION" "$state_text"
+     fi
+   fi
+   ui_rule "90" "─"
+   ui_group "环境准备"
+   ui_item "1" "安装 Caddy" "已装跳过"
+   ui_item "2" "依赖检测与安装"
+   printf '\n'
+   ui_group "反向代理"
+   ui_item "3" "配置反向代理"
+   ui_item "4" "查看服务状态"
+   ui_item "5" "查看反代配置" "含上游状态"
+   ui_item "6" "删除反向代理"
+   printf '\n'
+   ui_group "服务与日志"
+   ui_item "7" "重启 Caddy 服务"
+   ui_item "8" "日志查看"
+   ui_item "9" "日志轮转设置"
+   printf '\n'
+   ui_group "系统与证书"
+   ui_item "10" "卸载 Caddy" "删除配置" "1;31" "90"
+   ui_item "11" "依赖卸载" "默认仅新增"
+   ui_item "12" "证书管理" "查看/同步/日志" "1;33" "90"
+   ui_item "13" "手动编辑配置" "先校验再应用"
+   ui_item "14" "检查/更新脚本" "保留配置与证书"
+   ui_rule "90" "─"
+   ui_item "0" "退出"
+   if declare -f certificate_main_summary >/dev/null 2>&1; then
+     certificate_main_summary || true
+   fi
 }
 
 function reverse_proxy_menu() {
-    local proxy_opt
-    while true; do
-        ui_page '配置 & 启用反向代理'
-        ui_item 1 '反代本地端口'
-        ui_sub '域名 -> http://127.0.0.1:端口'
-        ui_item 2 '反代远程网址'
-        ui_sub '域名 -> https://目标网址'
-        printf '\n'; ui_item 0 '返回'; ui_rule '2' '-'
-        read -p '请输入选项 > ' proxy_opt || return
-        case "$proxy_opt" in
-            1) ui_page '反代本地端口'; setup_reverse_proxy ;;
-            2) ui_page '反代远程网址'; setup_reverse_proxy_remote ;;
-            0) return 0 ;;
-            *) ui_page '选项提示'; ui_warn '无效选项，请重新输入。' ;;
-        esac
-        ui_pause || return 0
-    done
+     local proxy_opt
+     while true; do
+         ui_page '配置 & 启用反向代理'
+         ui_item 1 '反代本地端口' '域名 -> http://127.0.0.1:端口'
+         ui_item 2 '反代远程网址' '域名 -> https://目标网址'
+         ui_rule '90' '─'
+         ui_item 0 '返回'
+         read -p '请输入选项 > ' proxy_opt || return
+         case "$proxy_opt" in
+             1) ui_page '反代本地端口'; setup_reverse_proxy ;;
+             2) ui_page '反代远程网址'; setup_reverse_proxy_remote ;;
+             0) return 0 ;;
+             *) ui_page '选项提示'; ui_warn '无效选项，请重新输入。' ;;
+         esac
+         ui_pause || return 0
+     done
 }
 
 function certificate_menu() {
-    local option path
-    while true; do
-        ui_page '证书管理'
-        ui_item 1 '查看证书与登记状态'
-        ui_item 2 '设置/修改目的目录'
-        ui_item 3 '立即同步已登记域名'
-        ui_item 4 '查看域名日志'
-        ui_item 5 '登记现有域名并开启复制'
-        ui_item 6 '取消域名复制'
-        ui_item 7 '申请证书' '（无需先配置反代）'
-        ui_item 8 '设置自动续签' '（开启/关闭/提前天数）'
-        ui_item 9 '查看技术详情' '（原始字段与诊断）'
-        ui_item 10 '等待域名证书签发'
-        printf '\n'; ui_item 0 '返回'; ui_rule '2' '-'
-        printf '请选择 > '
-        IFS= read -r option || return 0
-        case "$option" in
-            1) ui_page '查看证书与登记状态'
-                list_certificates ;;
-            2) ui_page '设置/修改目的目录'
-                certificate_set_directory_menu ;;
-            3) ui_page '立即同步已登记域名'
-                certificate_overview full && sync_certificates ;;
-            4) ui_page '查看域名日志'
-                if certificate_overview logs && certificate_select_domain available; then
-                    certificate_show_logs "$CERT_SELECTED_DOMAIN"
-                fi ;;
-            5) ui_page '登记现有域名并开启复制'
-                if certificate_overview full && certificate_select_domain available; then
-                    certificate_collect_choice "$CERT_SELECTED_DOMAIN" && certificate_after_proxy "$CERT_SELECTED_DOMAIN"
-                fi ;;
-            6) ui_page '取消域名复制'
-                if certificate_overview state && certificate_select_domain registered; then
-                    unregister_certificate_export "$CERT_SELECTED_DOMAIN" &&
-                        printf '复制登记已取消：%s\n' "$CERT_SELECTED_DOMAIN"
-                fi ;;
-            7) ui_page '申请域名证书'; certificate_request_menu ;;
-            8) ui_page '设置自动续签'; certificate_renewal_menu ;;
-            9) ui_page '证书技术详情'; certificate_technical_details ;;
-            10) ui_page '等待证书签发'
-                certificate_select_domain available && certificate_watch_domain "$CERT_SELECTED_DOMAIN" ;;
-            0) return 0 ;;
-            *) ui_page '选项提示'; ui_warn '无效选项。' ;;
-        esac
-        ui_pause || return 0
-    done
+     local option path
+     while true; do
+         ui_page '证书管理'
+         ui_group '日常管理'
+         ui_item 1 '查看证书与登记状态'
+         ui_item 2 '设置/修改目的目录'
+         ui_item 3 '立即同步已登记域名'
+         ui_item 4 '查看域名日志'
+        printf '\n'
+         ui_group '复制登记'
+         ui_item 5 '登记现有域名并开启复制'
+         ui_item 6 '取消域名复制'
+        printf '\n'
+         ui_group '签发与诊断'
+         ui_item 7 '申请证书' '无需先配置反代'
+         ui_item 8 '设置自动续签' '开启/关闭/提前天数'
+         ui_item 9 '查看技术详情' '原始字段与诊断'
+         ui_item 10 '等待域名证书签发'
+         ui_rule '90' '─'
+         ui_item 0 '返回'
+         printf '请选择 > '
+         IFS= read -r option || return 0
+         case "$option" in
+             1) ui_page '查看证书与登记状态'
+                 certificate_browse_menu; continue ;;
+             2) ui_page '设置/修改目的目录'
+                 certificate_set_directory_menu ;;
+             3) ui_page '立即同步已登记域名'
+                 certificate_overview full && sync_certificates ;;
+             4) ui_page '查看域名日志'
+                 if certificate_overview logs && certificate_select_domain available; then
+                     certificate_show_logs "$CERT_SELECTED_DOMAIN"
+                 fi ;;
+             5) ui_page '登记现有域名并开启复制'
+                 if certificate_overview full && certificate_select_domain available; then
+                     certificate_collect_choice "$CERT_SELECTED_DOMAIN" && certificate_after_proxy "$CERT_SELECTED_DOMAIN"
+                 fi ;;
+             6) ui_page '取消域名复制'
+                 if certificate_overview state && certificate_select_domain registered; then
+                     unregister_certificate_export "$CERT_SELECTED_DOMAIN" &&
+                         printf '复制登记已取消：%s\n' "$CERT_SELECTED_DOMAIN"
+                 fi ;;
+             7) ui_page '申请域名证书'; certificate_request_menu ;;
+             8) ui_page '设置自动续签'; certificate_renewal_menu ;;
+             9) ui_page '证书技术详情'; certificate_technical_details ;;
+             10) ui_page '等待证书签发'
+                 certificate_select_domain available && certificate_watch_domain "$CERT_SELECTED_DOMAIN" ;;
+             0) return 0 ;;
+             *) ui_page '选项提示'; ui_warn '无效选项。' ;;
+         esac
+         ui_pause || return 0
+     done
 }
 
 # Debian/Ubuntu dependency ownership; records are data, never shell code.
@@ -1325,27 +1614,28 @@ log_journal_view() {
 }
 
 logs_menu() {
-    local option
-    while true; do
-        ui_page '日志查看'
-        ui_item 1 'Caddy 服务日志'
-        ui_item 2 '证书同步文件日志'
-        ui_item 3 '证书同步任务日志'
-        ui_item 4 '按域名查看日志'
-        printf '\n'; ui_item 0 '返回'; ui_rule '2' '-'
-        printf '请选择 > '
-        IFS= read -r option || return 0
-        case "$option" in
-            1) ui_page 'Caddy 服务日志'; log_journal_view caddy ;;
-            2) ui_page '证书同步文件日志'; log_file_view "$CERT_STATE_DIR/sync.log" ;;
-            3) ui_page '证书同步任务日志'; log_journal_view easy-caddy-cert-sync ;;
-            4) ui_page '按域名查看日志'
-                if certificate_overview logs && certificate_select_domain available; then certificate_show_logs "$CERT_SELECTED_DOMAIN"; fi ;;
-            0) return 0 ;;
-            *) ui_page '选项提示'; ui_warn '无效日志选项。' ;;
-        esac
-        ui_pause || return 0
-    done
+     local option
+     while true; do
+         ui_page '日志查看'
+         ui_item 1 'Caddy 服务日志' '最近 200 行'
+         ui_item 2 '证书同步文件日志' '最近 200 行'
+         ui_item 3 '证书同步任务日志' '最近 200 行'
+         ui_item 4 '按域名查看日志' '先选择域名'
+         ui_rule '90' '─'
+         ui_item 0 '返回'
+         printf '请选择 > '
+         IFS= read -r option || return 0
+         case "$option" in
+             1) ui_page 'Caddy 服务日志'; log_journal_view caddy ;;
+             2) ui_page '证书同步文件日志'; log_file_view "$CERT_STATE_DIR/sync.log" ;;
+             3) ui_page '证书同步任务日志'; log_journal_view easy-caddy-cert-sync ;;
+             4) ui_page '按域名查看日志'
+                 if certificate_overview logs && certificate_select_domain available; then certificate_show_logs "$CERT_SELECTED_DOMAIN"; fi ;;
+             0) return 0 ;;
+             *) ui_page '选项提示'; ui_warn '无效日志选项。' ;;
+         esac
+         ui_pause || return 0
+     done
 }
 
 log_rotation_safe_file() {
@@ -1375,10 +1665,13 @@ log_rotation_show() {
         case "$value" in daily) period='每天' ;; weekly) period='每周' ;; monthly) period='每月' ;; *) certificate_error '轮转周期记录无效。'; return 1 ;; esac
     fi
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet easy-caddy-logrotate.timer; then state='运行中'; fi
-    printf '当前轮转周期：%s\n定时检查：%s（每小时检查）\n' "$period" "$state"
-    printf '保留：14 份；大小上限触发：10 MiB。\n轮转文件：%s/sync.log\n' "$CERT_STATE_DIR"
-    printf 'Caddy/任务服务日志继续使用 journald 的现有保留策略；本设置管理脚本文件日志。\n\n'
-    command -v logrotate >/dev/null 2>&1 || printf '缺少 logrotate，请先通过主菜单 2 安装依赖。\n'
+    ui_group '当前设置'
+    printf '  轮转周期：%s\n  定时检查：%s（每小时检查）\n' "$period" "$state"
+    printf '  保留 14 份；超过 10 MiB 提前轮转。\n  轮转文件：\n  %s/sync.log\n' "$CERT_STATE_DIR"
+    ui_sub 'Caddy 与任务服务日志：'
+    ui_sub '沿用 journald 现有保留策略；'
+    ui_sub '本设置管理脚本文件日志。'
+    command -v logrotate >/dev/null 2>&1 || { printf '  '; ui_say '33' '缺少 logrotate。'; printf '  '; ui_say '33' '请先通过主菜单 2 安装依赖。'; }
 }
 
 log_rotation_quote() {
@@ -1463,14 +1756,20 @@ log_rotation_apply() (
 )
 
 log_rotation_menu() {
-    local choice period answer
-    log_rotation_show || return 1
-    printf '请选择轮转周期：\n 1) 每天\n 2) 每周\n 3) 每月\n 0) 返回\n'
-    IFS= read -r choice || return 0
-    case "$choice" in 1) period=daily ;; 2) period=weekly ;; 3) period=monthly ;; 0|'') return 0 ;; *) certificate_error '无效轮转周期。'; return 1 ;; esac
-    printf '将轮转 %s/sync.log，保留14份，大小触发10MiB，周期%s。\n确认应用？[y/yes，默认 n]：\n' "$CERT_STATE_DIR" "$period"
-    IFS= read -r answer || return 0
-    case "${answer,,}" in y|yes) log_rotation_apply "$period" ;; *) printf '操作已取消。\n' ;; esac
+     local choice period answer
+     log_rotation_show || return 1
+     ui_ask '请选择轮转周期：'
+     ui_item 1 '每天'
+     ui_item 2 '每周'
+     ui_item 3 '每月'
+     ui_rule '90' '─'
+     ui_item 0 '返回'
+     IFS= read -r choice || return 0
+     case "$choice" in 1) period=daily ;; 2) period=weekly ;; 3) period=monthly ;; 0|'') return 0 ;; *) certificate_error '无效轮转周期。'; return 1 ;; esac
+     printf '\n将轮转 %s/sync.log，保留14份，大小触发10MiB，周期%s。\n' "$CERT_STATE_DIR" "$period"
+     ui_ask '确认应用？[y/yes，默认 n]：'
+     IFS= read -r answer || return 0
+     case "${answer,,}" in y|yes) log_rotation_apply "$period" ;; *) printf '操作已取消。\n' ;; esac
 }
 
 #--------------------------------------------
@@ -2658,35 +2957,49 @@ certificate_ui_export_result() {
 }
 
 certificate_ui_domain_status() {
-    local root=$1 domain=$2 registered=$3 dest=$4 cert='' code times expires starts now days issuer
-    printf '\n域名：%s\n' "$domain"
-    cert=$(certificate_select_pair "$root" "$domain"); code=$?
-    if [ "$code" = 0 ]; then
-        times=$(certificate_pair_valid "$cert" "${cert%.crt}.key" "$domain") || return 1
-        read -r expires starts <<< "$times"
-        now=$(date +%s); days=$(((expires-now)/86400))
-        printf '  证书已签发，当前有效，证书与私钥匹配。\n'
-        printf '  生效时间：%s\n  到期时间：%s（剩余 %s 天）\n' "$(certificate_ui_human_date "$starts")" "$(certificate_ui_human_date "$expires")" "$days"
-        issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt multiline 2>/dev/null | awk -F'= *' '/organizationName/{print $2; exit}')
-        [ -n "$issuer" ] || issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt multiline 2>/dev/null | awk -F'= *' '/commonName/{print $2; exit}')
-        printf '  签发机构：%s（这里只核对文件和配对，未验证公网信任链）\n' "${issuer:-无法读取}"
-    elif [ "$code" = 2 ]; then
-        local found
-        found=$(certificate_candidates "$root" "$domain" | tr '\0' '\n') || return 1
-        if [ -n "$found" ]; then
-            printf '  已发现证书文件，但已过期、尚未生效或配对异常；请查看技术详情，原副本不会被覆盖。\n'
-        elif [[ "$(certificate_automation_read "$domain")" = 'off 0 fixed' ]]; then
-            printf '  固定证书已到期或不可读取；自动续签保持关闭，请在到期前手动处理。\n'
-        else printf '  正在等待签发，目前还没有发现可用证书（待签发/未发现）。\n'; fi
-    else return 1; fi
-    certificate_automation_describe "$domain" || return 1
-    if [ "$registered" = yes ]; then
-        printf '  自动复制：已登记。\n'
-        if [ -n "$dest" ]; then
-            printf '  复制结果：'; certificate_ui_export_result "$dest" "$domain" "$cert"; printf '\n'
-            printf '  证书文件：%s/%s/fullchain.pem\n  私钥文件：%s/%s/privkey.pem\n' "$dest" "$domain" "$dest" "$domain"
-        else printf '  复制位置尚未设置，请先选择父目录。\n'; fi
-    else printf '  自动复制：未登记；证书仍保留在 Caddy 自己的证书目录里。\n'; fi
+     local root=$1 domain=$2 registered=$3 dest=$4 cert='' code times expires starts now days issuer found auto line
+     if ui_color_enabled; then ui_paint "1;35" "  ◆ "; ui_paint "96" "$domain"; printf "\n"; else printf '\n  域名：%s\n' "$domain"; fi
+     cert=$(certificate_select_pair "$root" "$domain"); code=$?
+     if [ "$code" = 0 ]; then
+         times=$(certificate_pair_valid "$cert" "${cert%.crt}.key" "$domain") || return 1
+         read -r expires starts <<< "$times"
+         now=$(date +%s); days=$(((expires-now)/86400))
+         if ui_color_enabled; then printf '  '; ui_paint "1;32" "● 已签发"; ui_paint "90" " · 当前有效"; printf '\n'; else printf '  证书已签发，当前有效。\n'; fi
+         if ui_color_enabled; then printf '  '; ui_paint "90" "证书与私钥匹配。"; printf '\n'; else printf '  证书与私钥匹配。\n'; fi
+         if ui_color_enabled; then ui_field "生效:" "$(certificate_ui_human_date "$starts")" "90" "97"; ui_field "到期:" "$(certificate_ui_human_date "$expires")" "90" "97"; ui_field "剩余:" "${days} 天" "90" "93"; else printf '  生效时间：%s\n  到期时间：%s\n  距到期还有 %s 天\n' "$(certificate_ui_human_date "$starts")" "$(certificate_ui_human_date "$expires")" "$days"; fi
+         issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt multiline 2>/dev/null | awk -F'= *' '/organizationName/{print $2; exit}')
+         [ -n "$issuer" ] || issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt multiline 2>/dev/null | awk -F'= *' '/commonName/{print $2; exit}')
+         if ui_color_enabled; then ui_field "签发:" "${issuer:-无法读取}" "90" "97"; else printf '  签发机构：%s\n' "${issuer:-无法读取}"; fi
+         ui_sub '只核对文件与配对，未验证公网信任链'
+     elif [ "$code" = 2 ]; then
+         found=$(certificate_candidates "$root" "$domain" | tr '\0' '\n') || return 1
+         if [ -n "$found" ]; then
+             if ui_color_enabled; then printf '  '; ui_paint "1;33" "● 证书不可用"; printf '\n'; else printf '  已发现证书文件，但不能直接使用。\n'; fi
+             ui_sub '已过期、尚未生效或配对异常 · 原副本不会被覆盖'
+         elif [[ "$(certificate_automation_read "$domain")" = 'off 0 fixed' ]]; then
+             if ui_color_enabled; then printf '  '; ui_paint "1;33" "● 固定证书到期"; printf '\n'; else printf '  固定证书已到期或不可读取\n'; fi
+             ui_sub '自动续签保持关闭 · 到期前请手动处理'
+         else
+             if ui_color_enabled; then printf '  '; ui_paint "1;33" "● 等待签发"; printf '\n'; else printf '  正在等待签发\n'; fi
+             ui_sub '目前没有可用证书（待签发/未发现）'
+         fi
+     else return 1; fi
+     auto=$(certificate_automation_describe "$domain") || return 1
+     while IFS= read -r line; do
+       if ui_color_enabled && [[ "$line" == 自动续签*已开启* ]]; then printf '  '; ui_paint "32" "$line"; printf '\n'
+       elif ui_color_enabled && [[ "$line" == 自动续签*已关闭* ]]; then printf '  '; ui_paint "33" "$line"; printf '\n'
+       elif ui_color_enabled && [[ "$line" == 自动续签*沿用* ]]; then printf '  '; ui_paint "90" "$line"; printf '\n'
+       else printf '  %s\n' "$line"; fi
+     done <<< "$auto"
+     if [ "$registered" = yes ]; then
+         if ui_color_enabled; then printf '  '; ui_paint "90" "自动复制："; ui_paint "32" "已登记"; printf '\n'; else printf '  自动复制：已登记。\n'; fi
+         if [ -n "$dest" ]; then
+             if ui_color_enabled; then printf '  '; ui_paint "90" "复制结果："; printf ' '; certificate_ui_export_result "$dest" "$domain" "$cert" | while IFS= read -r l; do ui_paint "97" "$l"; done; printf '\n'; else printf '  复制结果：\n      '; certificate_ui_export_result "$dest" "$domain" "$cert"; printf '\n'; fi
+             if ui_color_enabled; then ui_field "证书:" "$dest/$domain/fullchain.pem" "90" "33"; ui_field "私钥:" "$dest/$domain/privkey.pem" "90" "31"; else printf '  证书文件：\n    %s/%s/fullchain.pem\n  私钥文件：\n    %s/%s/privkey.pem\n' "$dest" "$domain" "$dest" "$domain"; fi
+         else printf '  复制位置尚未设置，请先选择父目录。\n'; fi
+     else
+       if ui_color_enabled; then printf '  '; ui_paint "90" "自动复制："; ui_paint "90" "未登记"; printf ' · 证书仍在 Caddy 目录'; printf '\n'; else printf '  自动复制：未登记。\n  证书仍保留在 Caddy 的证书目录里。\n'; fi
+     fi
 }
 
 certificate_watch_domain() {
@@ -2742,17 +3055,25 @@ certificate_watch_domain() {
 }
 
 certificate_main_summary() {
-    local domains domain dest='' summary total=0 ready=0
-    domains=$(certificate_read_domains 2>/dev/null) || { printf '  证书状态暂时无法读取，请进入 12 查看原因。\n'; return 0; }
-    [ -n "$domains" ] || return 0
-    dest=$(certificate_read_directory 2>/dev/null) || { printf '  已登记证书复制，但父目录不可读，请进入 12 处理。\n'; return 0; }
-    while IFS= read -r domain; do
-        total=$((total+1))
-        if certificate_pair_valid "$dest/$domain/fullchain.pem" "$dest/$domain/privkey.pem" "$domain" >/dev/null 2>&1; then
-            ready=$((ready+1)); printf '  %s：证书已复制，可使用。\n' "$domain"
-        else printf '  %s：尚未复制可用证书，请进入 12 查看签发进度。\n' "$domain"; fi
-    done <<< "$domains"
-    printf '  证书副本：%s/%s 已准备好；详情在 12 证书管理。\n' "$ready" "$total"
+     local domains domain dest='' total=0 ready=0
+     if ! domains=$(certificate_read_domains 2>/dev/null); then
+         ui_group '证书'; printf '  状态暂时无法读取，见 12 查看原因。\n'; return 0
+     fi
+     [ -n "$domains" ] || return 0
+     if ! dest=$(certificate_read_directory 2>/dev/null); then
+         ui_group '证书'; printf '  父目录不可读，见 12 处理。\n'; return 0
+     fi
+     ui_group '证书'
+     while IFS= read -r domain; do
+         total=$((total+1))
+         if ui_color_enabled; then printf '  '; ui_paint "96" "$domain"; printf '\n'; else printf '  %s\n' "$domain"; fi
+         if certificate_pair_valid "$dest/$domain/fullchain.pem" "$dest/$domain/privkey.pem" "$domain" >/dev/null 2>&1; then
+             ready=$((ready+1)); if ui_color_enabled; then printf '    '; ui_paint "32" "● 已复制，可使用"; printf '\n'; else printf '    证书已复制，可使用。\n'; fi
+         else
+             if ui_color_enabled; then printf '    '; ui_paint "33" "○ 尚未复制，见 12 查看进度"; printf '\n'; else printf '    尚未复制可用证书，见 12 查看进度。\n'; fi
+         fi
+     done <<< "$domains"
+     if ui_color_enabled; then printf '  '; ui_paint "90" "可用副本 $ready/$total · 详情见 12"; printf '\n'; else printf '  可用副本 %s/%s，详情见 12 证书管理。\n' "$ready" "$total"; fi
 }
 
 certificate_set_directory_menu() {
@@ -2778,6 +3099,289 @@ certificate_set_directory_menu() {
         case "${answer,,}" in y|yes) ;; *) printf '已取消，请选择上一级父目录。\n'; return 0 ;; esac
     fi
     set_certificate_export_directory "$path"
+}
+
+_cb_domain_brief() {
+  local root="$1" domain="$2" registered_list="$3"
+  local crt rc pair_out pair_rc expires starts now days reg_flag
+  crt=$(certificate_select_pair "$root" "$domain")
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    if printf "%s\n" "$registered_list" | grep -Fxq "$domain"; then
+      reg_flag="复制已登记"
+    else
+      reg_flag="未登记"
+    fi
+    pair_out=$(certificate_pair_valid "$crt" "${crt%.crt}.key" "$domain")
+    pair_rc=$?
+    if [ "$pair_rc" -ne 0 ]; then
+      printf "状态异常 · %s" "$reg_flag"
+      return "$pair_rc"
+    fi
+    read -r expires starts <<<"$pair_out"
+    now=$(date +%s)
+    if [ -n "$expires" ] && [ "$expires" -gt 0 ] 2>/dev/null; then
+      days=$(( (expires - now) / 86400 ))
+      if [ "$days" -lt 0 ]; then days=0; fi
+      printf "有效 · 剩%d天 · %s" "$days" "$reg_flag"
+    else
+      printf "有效 · %s" "$reg_flag"
+    fi
+    return 0
+  elif [ "$rc" -eq 2 ]; then
+    printf "待签发或暂无可用证书"
+    return 0
+  else
+    printf "读取失败"
+    return "$rc"
+  fi
+}
+
+_cb_collect_domains() {
+  local root="$1" registered="$2" available="$3"
+  local -a cands=()
+  local cand_domains="" p d
+  mapfile -d '' -t cands < <(certificate_candidates "$root")
+  wait "$!" || return 1
+  if [ "${#cands[@]}" -gt 0 ]; then
+    for p in "${cands[@]}"; do
+      [ -z "$p" ] && continue
+      d="${p%/*}"; d="${d##*/}"
+      [ -z "$d" ] && continue
+      cand_domains+="${d}"$'\n'
+    done
+  fi
+  printf "%s\n%s\n%s\n" "$registered" "$available" "$cand_domains" | sed '/^$/d' | LC_ALL=C sort -u
+}
+
+certificate_browse_menu() {
+  if ! ui_interactive; then
+    list_certificates
+    return $?
+  fi
+  local dep_out dep_rc
+  dep_out=$(certificate_dependencies 2>&1)
+  dep_rc=$?
+  if [ "$dep_rc" -ne 0 ]; then
+    if [ -n "$dep_out" ]; then printf "%s\n" "$dep_out"; fi
+    ui_pause || true
+    return "$dep_rc"
+  fi
+  local root_out root_rc root
+  root_out=$(certificate_storage_root)
+  root_rc=$?
+  if [ "$root_rc" -ne 0 ]; then
+    if [ -n "$root_out" ]; then printf "%s\n" "$root_out"; fi
+    ui_warn "无法确定证书存储位置"
+    ui_pause || true
+    return "$root_rc"
+  fi
+  root="$root_out"
+  local registered registered_rc available available_rc
+  registered=$(certificate_read_domains)
+  registered_rc=$?
+  if [ "$registered_rc" -ne 0 ]; then
+    ui_warn "读取登记域名失败"
+    ui_pause || true
+    return "$registered_rc"
+  fi
+  available=$(certificate_available_domains)
+  available_rc=$?
+  if [ "$available_rc" -ne 0 ]; then
+    ui_warn "读取可用域名失败"
+    ui_pause || true
+    return "$available_rc"
+  fi
+  local all_domains
+  if ! all_domains=$(_cb_collect_domains "$root" "$registered" "$available"); then
+    ui_warn "证书候选读取失败"
+    ui_pause || true
+    return 1
+  fi
+  local -a domains=()
+  if [ -n "$all_domains" ]; then
+    mapfile -t domains <<<"$all_domains"
+    local -a tmp=()
+    local dd
+    for dd in "${domains[@]}"; do [ -n "$dd" ] && tmp+=("$dd"); done
+    domains=("${tmp[@]}")
+  fi
+  local total=${#domains[@]}
+  if [ "$total" -eq 0 ]; then
+    ui_page '证书浏览'
+    ui_sub "暂无已登记或可发现的证书域名"
+    printf "\n"
+    ui_sub "下一步：到“证书管理”选择 7) 申请证书 完成签发，或检查反代配置是否已生成证书；已有证书可用 3) 同步到复制目录"
+    ui_sub "说明：未设置父目录不影响 Caddy 申请证书，仅影响自动复制"
+    ui_pause || return 0
+    return 0
+  fi
+  local dest="" dest_rc
+  if [ -e "$CERT_STATE_DIR/export-directory" ] || [ -L "$CERT_STATE_DIR/export-directory" ]; then
+    dest=$(certificate_read_directory)
+    dest_rc=$?
+    if [ "$dest_rc" -ne 0 ]; then
+      ui_warn "读取复制目录失败"
+      ui_pause || true
+      return "$dest_rc"
+    fi
+  fi
+  local page_size=14
+  local page=0
+  local pages input_error=""
+  pages=$(( (total + page_size - 1) / page_size ))
+  while true; do
+    ui_page '证书浏览'
+    if [ -n "$input_error" ]; then
+      ui_warn "$input_error"
+      printf "\n"
+      input_error=""
+    fi
+    if [ "$pages" -gt 1 ]; then
+      ui_sub "共 ${total} 个域名  ·  第 $((page+1))/${pages} 页  ·  输入编号查看详情，0 返回"
+    else
+      ui_sub "共 ${total} 个域名  ·  输入编号查看详情，0 返回"
+    fi
+    if [ -n "$dest" ]; then
+      ui_sub "复制目录：$dest"
+    else
+      ui_sub "未设置父目录不影响 Caddy 申请证书，仅影响自动复制"
+    fi
+    printf "\n"
+    local start end
+    start=$((page * page_size))
+    end=$((start + page_size))
+    if [ "$end" -gt "$total" ]; then end="$total"; fi
+    local i d brief brief_rc
+    for ((i=start; i<end; i++)); do
+      d="${domains[i]}"
+      brief_rc=0
+      brief=$(_cb_domain_brief "$root" "$d" "$registered")
+      brief_rc=$?
+      if [ "$brief_rc" -ne 0 ]; then
+        ui_warn "$d: $brief"
+        ui_pause || true
+        return "$brief_rc"
+      fi
+      ui_item "$((i+1))" "$d" "$brief"
+    done
+    printf "\n"
+    if [ "$pages" -gt 1 ]; then
+      ui_sub "翻页：n 下一页 / p 上一页 / 0 返回证书菜单"
+    else
+      ui_sub "0 返回证书菜单"
+    fi
+    local choice
+    printf "\n"
+    if ! read -r -p "请输入编号 (0 返回): " choice; then
+      return 0
+    fi
+    choice=$(printf "%s" "$choice" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ "$choice" = "n" ] || [ "$choice" = "N" ]; then
+      if [ "$pages" -gt 1 ]; then page=$(( (page + 1) % pages )); fi
+      continue
+    fi
+    if [ "$choice" = "p" ] || [ "$choice" = "P" ]; then
+      if [ "$pages" -gt 1 ]; then page=$(( (page - 1 + pages) % pages )); fi
+      continue
+    fi
+    if [ "$choice" = "0" ]; then
+      return 0
+    fi
+    if ! [[ "$choice" =~ ^[0-9]{1,6}$ ]]; then
+      input_error="请输入有效编号 1-${total}，或 0 返回 / n/p 翻页（不支持超长数字）"
+      continue
+    fi
+    local choice_num idx
+    choice_num=$((10#$choice))
+    if [ "$choice_num" -lt 1 ] || [ "$choice_num" -gt "$total" ]; then
+      input_error="编号超出范围：1-${total}"
+      continue
+    fi
+    idx=$((choice_num - 1))
+    local sel_domain="${domains[idx]}"
+    local reg_flag="no"
+    if printf "%s\n" "$registered" | grep -Fxq "$sel_domain"; then reg_flag="yes"; fi
+    ui_page '证书详情'
+    ui_sub "$sel_domain"
+    printf "\n"
+    local detail_rc=0
+    certificate_ui_domain_status "$root" "$sel_domain" "$reg_flag" "$dest"
+    detail_rc=$?
+    if ! ui_pause; then
+      return 0
+    fi
+    if [ "$detail_rc" -ne 0 ]; then
+      return "$detail_rc"
+    fi
+  done
+}
+
+_ui_cols() {
+  local c="${COLUMNS:-}"
+  if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -gt 0 ] 2>/dev/null; then
+    printf "%s" "$c"
+  else
+    printf "80"
+  fi
+}
+
+_ui_width() {
+  local s="${1:-}"
+  local w=0 i ch code
+  local len=${#s}
+  for ((i=0;i<len;i++)); do
+    ch="${s:i:1}"
+    [ -z "$ch" ] && continue
+    if [ "$ch" = "'" ]; then
+      code=39
+    else
+      printf -v code "%d" "'$ch" 2>/dev/null || code=200
+    fi
+    if [ "$code" -ge 32 ] && [ "$code" -le 126 ]; then
+      w=$((w+1))
+    else
+      w=$((w+2))
+    fi
+  done
+  printf "%d" "$w"
+}
+
+proxy_view_adapt_json() {
+  local cf="$1" out="$2" err="$3"
+  caddy_adapt_quiet caddy adapt --adapter caddyfile --config "$cf" >"$out" 2>"$err"
+  return $?
+}
+
+proxy_view_format_one() {
+   local obj="$1"
+   local hosts paths dials dyn has_tls proto
+   hosts=$(printf '%s' "$obj" | jq -r 'if (.hosts|length)==0 then "未限定域名" else (.hosts|join(", ")) end' 2>/dev/null)
+   paths=$(printf '%s' "$obj" | jq -r 'if (.paths|length)==0 then "" else (.paths|join(", ")) end' 2>/dev/null)
+   dials=$(printf '%s' "$obj" | jq -r '[.upstreams[]? | .dial // empty] | join(", ")' 2>/dev/null)
+   dyn=$(printf '%s' "$obj" | jq -r '.dynamic // false' 2>/dev/null)
+   has_tls=$(printf '%s' "$obj" | jq -r 'if .transport and (.transport|has("tls")) then "1" else "0" end' 2>/dev/null)
+   proto=$(printf '%s' "$obj" | jq -r '.transport.protocol // ""' 2>/dev/null)
+   if [ -z "$hosts" ]; then hosts="未限定域名"; fi
+   if ui_color_enabled; then
+     printf '  '; ui_paint "90" "-"; printf ' '; ui_paint "96" "$hosts"; printf '\n'
+     if [ -n "$paths" ]; then printf '    '; ui_paint "90" "路径:"; printf ' '; ui_paint "33" "$paths"; printf '\n'; fi
+     if [ -z "$dials" ]; then
+       printf '    '; ui_paint "90" "上游:"; printf ' '; ui_paint "33" "(动态上游，无法列出完整 dial)"; printf '\n'
+     else
+       printf '    '; ui_paint "90" "上游:"; printf ' '
+       if [ "$dyn" = "true" ]; then ui_paint "93" "$dials"; ui_paint "90" " (含动态，只读摘要)"; else ui_paint "97" "$dials"; fi; printf '\n'
+     fi
+     local tail=""; if [ "$has_tls" = "1" ]; then tail="${tail} [https]"; fi; if [ -n "$proto" ] && [ "$proto" != "http" ]; then tail="${tail} [协议:${proto}]"; fi
+     if [ -n "$tail" ]; then printf '    '; ui_paint "90" "${tail# }"; printf ' '; ui_paint "90" "[只读/未登记]"; printf '\n'; else printf '    '; ui_paint "90" "[只读/未登记]"; printf '\n'; fi
+   else
+     printf '  - %s\n' "$hosts"
+     if [ -n "$paths" ]; then printf '    路径: %s\n' "$paths"; fi
+     if [ -z "$dials" ]; then printf '    上游: (动态上游，无法列出完整 dial)\n'
+     else if [ "$dyn" = "true" ]; then printf '    上游: %s (含动态上游，展示为只读摘要)\n' "$dials"; else printf '    上游: %s\n' "$dials"; fi; fi
+     local tail=""; if [ "$has_tls" = "1" ]; then tail="${tail} [https]"; fi; if [ -n "$proto" ] && [ "$proto" != "http" ]; then tail="${tail} [协议:${proto}]"; fi
+     printf '    %s [配置来源，未探测 只读/未登记]\n' "$tail"
+   fi
 }
 
 # Root already has privileges. Avoid repeated sudo hostname-resolution noise in
